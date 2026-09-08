@@ -243,11 +243,21 @@ else. It warns at startup if this isn't set.
 
 `claude-haiku-4-5` by default (`NEXUS_MODEL` to override). Deciding which of
 three tools to call is a routing job, not a reasoning one, and Haiku is fast
-and cheap at it. The code sets neither `thinking` nor `temperature`, so it
-also runs unchanged on `claude-sonnet-5` or `claude-opus-5` if you want to
-compare -- those run adaptive thinking by default (and reject `temperature`
-alongside it), which is why `max_tokens` is left at a roomy 8192: thinking
-tokens count against it. `run()` already handles the block-style content a
+and cheap at it.
+
+`max_tokens` is 1024 (`NEXUS_MAX_TOKENS` to override). That is a ceiling on
+one response, not a spend, and it cannot stop the model hallucinating -- but
+it bounds the damage. Telegram rejects messages over 4096 characters, about
+1000 English tokens, so anything longer could not be delivered anyway, and
+worst-case spend per message becomes `MAX_TOOL_LOOPS x max_tokens`. Hitting
+the ceiling shows up as a reply cut off mid-sentence; a very long task list
+is the only realistic way to get there.
+
+The code sets neither `thinking` nor `temperature`, so it runs unchanged on
+`claude-sonnet-5` or `claude-opus-5` if you want to compare. Those run
+adaptive thinking by default (and reject `temperature` alongside it), and
+thinking tokens count against `max_tokens`, so raise `NEXUS_MAX_TOKENS` to
+~8192 when you switch. `run()` already handles the block-style content a
 thinking model returns.
 
 ## What's deliberately not here (yet)

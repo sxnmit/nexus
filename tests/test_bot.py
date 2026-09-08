@@ -215,3 +215,7 @@ def test_todoist_base_url_defaults_to_the_unified_v1_api():
 
 def test_model_defaults_to_haiku():
     assert config.MODEL == "claude-haiku-4-5"
+
+
+def test_max_tokens_defaults_to_a_telegram_sized_ceiling():
+    assert config.MAX_TOKENS == 1024

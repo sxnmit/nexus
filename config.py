@@ -26,10 +26,14 @@ _REQUIRED = {
 # Haiku: this is a routing job, not a reasoning one, and it is fast and cheap.
 MODEL = os.getenv("NEXUS_MODEL", "claude-haiku-4-5")
 
-# Replies are one or two sentences, but if you point NEXUS_MODEL at a thinking
-# model (e.g. claude-opus-5) its thinking tokens count against this too, so
-# leave headroom -- unused tokens cost nothing.
-MAX_TOKENS = 8192
+# A ceiling on one response, not a spend: unused tokens cost nothing, and it
+# cannot stop the model hallucinating -- it bounds the damage. Replies are one
+# or two sentences, and Telegram rejects messages over 4096 characters (about
+# 1000 English tokens), so nothing longer could be delivered anyway. Worst-case
+# spend per message is MAX_TOOL_LOOPS x MAX_TOKENS. Raise this to ~8192 if you
+# point NEXUS_MODEL at a thinking model (claude-opus-5, claude-sonnet-5): its
+# thinking tokens count against the same ceiling.
+MAX_TOKENS = int(os.getenv("NEXUS_MAX_TOKENS", "1024"))
 
 # Todoist's current unified API. The older REST v2 base
 # (https://api.todoist.com/rest/v2) uses identical paths for the three endpoints
