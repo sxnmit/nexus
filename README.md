@@ -21,8 +21,14 @@ here](#whats-deliberately-not-here-yet) for how those would slot in.
 
 ## Quick start
 
+Needs **Python 3.11 or newer** (CI runs 3.11-3.13). Check `python3 --version`
+first: macOS ships 3.9 at `/usr/bin/python3`, and on that `pip` fails with
+*Could not find a version that satisfies the requirement anthropic==...*
+because the whole stack requires 3.10+. `brew install python@3.12` (or
+`uv venv --python 3.12`) fixes it.
+
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python3.12 -m venv .venv && source .venv/bin/activate   # any 3.11+ interpreter
 pip install -r requirements.txt
 
 cp .env.example .env      # then fill in the three tokens
@@ -216,6 +222,18 @@ The stack: [LangGraph](https://langchain-ai.github.io/langgraph/) for the loop,
 and plain `httpx` against Todoist.
 
 ## Things to know
+
+### Which Claude key
+
+`PERSONAL_ACCESS_TOKEN_CLAUDE` can be either kind of key from the Anthropic
+Console. A key created *inside a workspace* just works. An org-level
+**personal access token** does not know which workspace it is acting in, and
+the API refuses it with *"This API key is not scoped to a workspace..."* --
+set `ANTHROPIC_WORKSPACE_ID` (Settings -> Workspaces; ids start with
+`wrkspc_`) and the bot sends it as the `anthropic-workspace-id` header.
+`bot.py` makes one free call to the token-count endpoint at startup, so
+either problem fails on boot with that message rather than on your first
+Telegram message.
 
 ### Todoist API version
 
