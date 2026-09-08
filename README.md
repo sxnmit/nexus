@@ -223,6 +223,18 @@ and plain `httpx` against Todoist.
 
 ## Things to know
 
+### Which Claude key
+
+`PERSONAL_ACCESS_TOKEN_CLAUDE` can be either kind of key from the Anthropic
+Console. A key created *inside a workspace* just works. An org-level
+**personal access token** does not know which workspace it is acting in, and
+the API refuses it with *"This API key is not scoped to a workspace..."* --
+set `ANTHROPIC_WORKSPACE_ID` (Settings -> Workspaces; ids start with
+`wrkspc_`) and the bot sends it as the `anthropic-workspace-id` header.
+`bot.py` makes one free call to the token-count endpoint at startup, so
+either problem fails on boot with that message rather than on your first
+Telegram message.
+
 ### Todoist API version
 
 This uses Todoist's current unified API at `https://api.todoist.com/api/v1`

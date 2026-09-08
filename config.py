@@ -16,6 +16,12 @@ ANTHROPIC_API_KEY = os.getenv("PERSONAL_ACCESS_TOKEN_CLAUDE", "")
 TODOIST_API_TOKEN = os.getenv("API_TOKEN_TODOIST", "")
 TELEGRAM_BOT_TOKEN = os.getenv("API_TOKEN_TELEGRAM", "")
 
+# Only needed when PERSONAL_ACCESS_TOKEN_CLAUDE is an org-level personal access
+# token: Anthropic then insists on knowing which workspace it acts in (Console
+# -> Settings -> Workspaces; ids start with wrkspc_). A key created inside a
+# workspace already knows and can leave this empty.
+ANTHROPIC_WORKSPACE_ID = os.getenv("ANTHROPIC_WORKSPACE_ID", "")
+
 _REQUIRED = {
     "PERSONAL_ACCESS_TOKEN_CLAUDE": ANTHROPIC_API_KEY,
     "API_TOKEN_TODOIST": TODOIST_API_TOKEN,

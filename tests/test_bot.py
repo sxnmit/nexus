@@ -169,6 +169,23 @@ def test_main_exits_when_todoist_is_unreachable(monkeypatch, todoist_api):
     assert "TODOIST_API_BASE" in str(excinfo.value), "should hint at the API-version fallback"
 
 
+def test_main_exits_when_claude_rejects_the_key(monkeypatch, todoist_api):
+    monkeypatch.setattr(config, "missing_settings", lambda: [])
+    todoist_api(tasks=[])
+
+    def refuse():
+        raise RuntimeError("This API key is not scoped to a workspace, so this request must include ...")
+
+    monkeypatch.setattr(bot, "check_model", refuse)
+
+    with pytest.raises(SystemExit) as excinfo:
+        bot.main()
+
+    message = str(excinfo.value)
+    assert "Claude check failed" in message and "not scoped to a workspace" in message
+    assert "ANTHROPIC_WORKSPACE_ID" in message, "should point at the fix"
+
+
 def test_main_wires_the_handlers_and_starts_polling(monkeypatch, todoist_api):
     monkeypatch.setattr(config, "missing_settings", lambda: [])
     todoist_api(tasks=[])
@@ -176,6 +193,7 @@ def test_main_wires_the_handlers_and_starts_polling(monkeypatch, todoist_api):
     builder = SimpleNamespace(token=lambda token: SimpleNamespace(build=lambda: app))
     monkeypatch.setattr(bot.Application, "builder", lambda: builder)
     monkeypatch.setattr(bot, "build_graph", lambda: "the-graph")
+    monkeypatch.setattr(bot, "check_model", lambda: None)
 
     bot.main()
 

@@ -18,7 +18,7 @@ from telegram.ext import (
 
 import config
 import todoist
-from agent import build_graph, run
+from agent import build_graph, check_model, run
 
 logging.basicConfig(format="%(asctime)s  %(levelname)-7s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -91,6 +91,21 @@ def main() -> None:
         ) from exc
 
     log.info("Todoist OK - %d open task(s). Model: %s", len(open_tasks), config.MODEL)
+
+    # Same idea for Claude. The token-count endpoint is free, so one call here
+    # surfaces a bad key, or a personal access token that has not been told its
+    # workspace, before anyone messages the bot.
+    try:
+        check_model()
+    except Exception as exc:  # whatever it is, we cannot start
+        raise SystemExit(
+            f"Claude check failed: {exc}\n"
+            "If PERSONAL_ACCESS_TOKEN_CLAUDE is an org-level personal access token, set "
+            "ANTHROPIC_WORKSPACE_ID in .env (Console -> Settings -> Workspaces, ids start "
+            "with wrkspc_). A key created inside a workspace needs no workspace id."
+        ) from exc
+
+    log.info("Claude OK.")
     if not config.ALLOWED_TELEGRAM_USER_IDS:
         log.warning(
             "TELEGRAM_ALLOWED_USER_IDS is not set - anyone who finds this bot can edit "

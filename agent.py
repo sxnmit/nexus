@@ -137,13 +137,31 @@ def _route(state: AgentState) -> Literal["tools", "__end__"]:
     return "tools"
 
 
-def _build_model() -> ChatAnthropic:
-    """Claude, with the three tools bound so it can emit tool calls."""
+def _build_llm() -> ChatAnthropic:
+    """The raw Claude client; `_build_model` is this with the tools bound."""
+    headers = None
+    if config.ANTHROPIC_WORKSPACE_ID:
+        # An org-level personal access token has to say which workspace it is
+        # acting in. A key created inside a workspace already knows.
+        headers = {"anthropic-workspace-id": config.ANTHROPIC_WORKSPACE_ID}
     return ChatAnthropic(
         model=config.MODEL,
         api_key=config.ANTHROPIC_API_KEY,
         max_tokens=config.MAX_TOKENS,
-    ).bind_tools(TOOLS)
+        default_headers=headers,
+    )
+
+
+def _build_model():
+    """Claude, with the three tools bound so it can emit tool calls."""
+    return _build_llm().bind_tools(TOOLS)
+
+
+def check_model() -> None:
+    """One call to the free token-count endpoint, so a bad key -- or a personal
+    access token that was never told its workspace -- fails at startup instead
+    of on the first message. Raises whatever the SDK raises."""
+    _build_llm().get_num_tokens_from_messages([HumanMessage("ping")])
 
 
 def build_graph(model=None):
