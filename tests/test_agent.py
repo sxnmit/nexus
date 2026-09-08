@@ -287,7 +287,7 @@ def test_run_strips_surrounding_whitespace(ask):
 
 
 def test_run_extracts_text_from_content_blocks(ask):
-    """With thinking on, Anthropic returns a list of blocks rather than a string."""
+    """A thinking model (NEXUS_MODEL=claude-opus-5) returns content blocks, not a string."""
     model = ScriptedModel(
         AIMessage(
             content=[

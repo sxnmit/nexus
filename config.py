@@ -23,10 +23,12 @@ _REQUIRED = {
 }
 
 # --- Tunables -----------------------------------------------------------------
-MODEL = os.getenv("NEXUS_MODEL", "claude-opus-5")
+# Haiku: this is a routing job, not a reasoning one, and it is fast and cheap.
+MODEL = os.getenv("NEXUS_MODEL", "claude-haiku-4-5")
 
-# Generous, because on Opus 5 thinking tokens count against max_tokens. Replies
-# themselves are one or two sentences.
+# Replies are one or two sentences, but if you point NEXUS_MODEL at a thinking
+# model (e.g. claude-opus-5) its thinking tokens count against this too, so
+# leave headroom -- unused tokens cost nothing.
 MAX_TOKENS = 8192
 
 # Todoist's current unified API. The older REST v2 base

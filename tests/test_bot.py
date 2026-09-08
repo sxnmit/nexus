@@ -211,3 +211,7 @@ def test_parse_user_ids(raw, expected):
 
 def test_todoist_base_url_defaults_to_the_unified_v1_api():
     assert config.TODOIST_API_BASE == "https://api.todoist.com/api/v1"
+
+
+def test_model_defaults_to_haiku():
+    assert config.MODEL == "claude-haiku-4-5"

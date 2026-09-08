@@ -241,10 +241,14 @@ else. It warns at startup if this isn't set.
 
 ### Model
 
-`claude-opus-5` by default (`NEXUS_MODEL` to override). Opus 5 runs adaptive
-thinking on its own, so the code doesn't set `thinking` or `temperature`
-(setting `temperature` alongside thinking is a 400 on this model).
-`max_tokens` is 8192 because thinking tokens count against it.
+`claude-haiku-4-5` by default (`NEXUS_MODEL` to override). Deciding which of
+three tools to call is a routing job, not a reasoning one, and Haiku is fast
+and cheap at it. The code sets neither `thinking` nor `temperature`, so it
+also runs unchanged on `claude-sonnet-5` or `claude-opus-5` if you want to
+compare -- those run adaptive thinking by default (and reject `temperature`
+alongside it), which is why `max_tokens` is left at a roomy 8192: thinking
+tokens count against it. `run()` already handles the block-style content a
+thinking model returns.
 
 ## What's deliberately not here (yet)
 
