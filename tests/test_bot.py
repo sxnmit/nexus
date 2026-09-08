@@ -174,7 +174,9 @@ def test_main_exits_when_claude_rejects_the_key(monkeypatch, todoist_api):
     todoist_api(tasks=[])
 
     def refuse():
-        raise RuntimeError("This API key is not scoped to a workspace, so this request must include ...")
+        raise RuntimeError(
+            "This API key is not scoped to a workspace, so this request must include ..."
+        )
 
     monkeypatch.setattr(bot, "check_model", refuse)
 
