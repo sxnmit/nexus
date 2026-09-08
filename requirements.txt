@@ -1,4 +1,6 @@
 # Runtime dependencies, pinned to the versions the test suite was run against.
+# Needs Python 3.11+. On an older interpreter pip says "Could not find a version
+# that satisfies the requirement anthropic==..." -- see README, Quick start.
 anthropic==1.4.0
 langchain-anthropic==1.7.1
 langchain-core==1.6.2

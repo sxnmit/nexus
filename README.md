@@ -21,8 +21,14 @@ here](#whats-deliberately-not-here-yet) for how those would slot in.
 
 ## Quick start
 
+Needs **Python 3.11 or newer** (CI runs 3.11-3.13). Check `python3 --version`
+first: macOS ships 3.9 at `/usr/bin/python3`, and on that `pip` fails with
+*Could not find a version that satisfies the requirement anthropic==...*
+because the whole stack requires 3.10+. `brew install python@3.12` (or
+`uv venv --python 3.12`) fixes it.
+
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python3.12 -m venv .venv && source .venv/bin/activate   # any 3.11+ interpreter
 pip install -r requirements.txt
 
 cp .env.example .env      # then fill in the three tokens
