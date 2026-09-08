@@ -1,0 +1,5 @@
+# Everything CI installs: runtime deps plus test and lint tooling.
+-r requirements.txt
+pytest==9.0.2
+pytest-cov==7.1.0
+ruff==0.15.8
