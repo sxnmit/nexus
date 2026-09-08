@@ -52,6 +52,48 @@ def test_close_task_tolerates_an_empty_204_body(http):
     assert todoist.close_task("1") is None
 
 
+def test_get_task_fetches_one_task(http):
+    http.queue(200, {"id": "5", "content": "A"})
+
+    assert todoist.get_task("5") == {"id": "5", "content": "A"}
+    assert (http.calls[0].method, http.calls[0].url) == (
+        "GET",
+        f"{config.TODOIST_API_BASE}/tasks/5",
+    )
+
+
+def test_update_task_posts_only_the_given_fields(http):
+    http.queue(200, {"id": "5", "content": "B", "priority": 4})
+
+    out = todoist.update_task("5", content="B", priority=4, due_string=None)
+
+    assert out == {"id": "5", "content": "B", "priority": 4}
+    assert (http.calls[0].method, http.calls[0].url) == (
+        "POST",
+        f"{config.TODOIST_API_BASE}/tasks/5",
+    )
+    assert http.calls[0].json == {"content": "B", "priority": 4}
+
+
+def test_update_task_fetches_the_task_when_the_server_returns_no_body(http):
+    http.queue(204)
+    http.queue(200, {"id": "5", "content": "B"})
+
+    assert todoist.update_task("5", content="B") == {"id": "5", "content": "B"}
+    assert [c.method for c in http.calls] == ["POST", "GET"]
+    assert http.calls[1].url == f"{config.TODOIST_API_BASE}/tasks/5"
+
+
+def test_delete_task_sends_delete(http):
+    http.queue(204)
+
+    assert todoist.delete_task("5") is None
+    assert (http.calls[0].method, http.calls[0].url) == (
+        "DELETE",
+        f"{config.TODOIST_API_BASE}/tasks/5",
+    )
+
+
 def test_base_url_has_no_trailing_slash(monkeypatch):
     # config strips it, so paths never produce a double slash.
     assert not config.TODOIST_API_BASE.endswith("/")
@@ -114,6 +156,7 @@ def test_http_errors_become_todoist_errors(http, status):
 
     assert str(status) in str(excinfo.value)
     assert "something went wrong" in str(excinfo.value)
+    assert excinfo.value.status_code == status, "the observe step decides from this"
 
 
 def test_error_detail_is_truncated_so_it_cannot_flood_the_prompt(http):
@@ -135,8 +178,10 @@ def test_an_empty_error_body_still_produces_a_readable_message(http):
 def test_network_failures_become_todoist_errors(http):
     http.error = httpx.ConnectError("name resolution failed")
 
-    with pytest.raises(todoist.TodoistError, match="Could not reach Todoist"):
+    with pytest.raises(todoist.TodoistError, match="Could not reach Todoist") as excinfo:
         todoist.get_tasks()
+
+    assert excinfo.value.status_code is None, "never reached Todoist"
 
 
 def test_timeouts_become_todoist_errors(http):

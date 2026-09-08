@@ -66,55 +66,67 @@ push and pull request, across Python 3.11-3.13.
 
 ## How the agent loop works
 
-Everything interesting is in [`agent.py`](agent.py); it's about 60 lines
-without comments. The graph is:
+Everything interesting is in [`agent.py`](agent.py). The graph is:
 
 ```
-                 ┌─────────────────────────────────────┐
-                 │                                     │
-  START ──► agent ──► _route ──► tools ──────────────┘
-              ▲                    │
-              │     no tool calls, │
-              │     or loop cap    ▼
-              └────────────────── END
+                 ┌────────────────────────────────────────────────┐
+                 │                                                │
+  START ──► agent ──► _route ──► tools ──► observe ───────────────┘
+              ▲
+              │      plain text, or loop cap
+              └─────────────────────────────────────► END
 ```
 
-Two nodes, one conditional edge, and the edge from `tools` back to `agent`.
-That back-edge is the whole point -- it's what makes this an agent rather than
-a single function call.
+Three nodes, one conditional edge, and the back-edge from `observe` to
+`agent`. That back-edge is what makes this an agent rather than a single
+function call -- and `observe` is what makes it an agent with a *policy*
+rather than one that hopes the model reacts well to errors.
 
 ### State
 
-The graph carries a `MessagesState`: a list of messages that only ever grows
-(LangGraph's `add_messages` reducer appends rather than replaces). Plus one
-extra field, `steps`, counting trips through the agent node.
+The graph carries a `MessagesState` -- a list of messages that only ever grows
+(LangGraph's `add_messages` reducer appends rather than replaces, except that a
+message with the same `id` replaces its predecessor, which `observe` relies
+on). Plus three fields:
+
+| Field     | Meaning                                                          |
+| --------- | ---------------------------------------------------------------- |
+| `steps`   | Trips through the agent node this run. The loop cap.             |
+| `retries` | Retries the observe step has granted this run. The retry budget. |
+| `mode`    | What the *next* agent turn is for: `act`, `retry`, or `respond`. |
 
 Every Telegram message starts with a fresh state containing only that one
 `HumanMessage`. By the time the run finishes the state holds the full
-exchange -- the user's text, Claude's tool calls, the tool results, Claude's
-final answer -- and then it's thrown away. That's what "no memory" means here.
+exchange and then it's thrown away. That's what "no memory" means here -- and
+see the caveat about clarifying questions at the end of this section.
 
 ### `agent` -- the plan step
 
 ```python
-def _agent_node(state, model):
-    reply = model.invoke([SystemMessage(_system_prompt())] + state["messages"])
-    return {"messages": [reply], "steps": state.get("steps", 0) + 1}
+def _agent_node(state, acting, responding):
+    mode = state.get("mode", "act")
+    model = responding if mode == "respond" else acting
+    reply = model.invoke([SystemMessage(_system_prompt(mode))] + state["messages"])
+    return {"messages": [reply], "steps": state.get("steps", 0) + 1, "mode": "act"}
 ```
 
-Send the conversation so far to Claude (with the three tools bound to it) and
-append whatever it says. Claude replies with one of two things:
+Send the conversation so far to Claude and append whatever it says: an
+`AIMessage` with **text** (it has an answer for the user) or with
+**`tool_calls`** (it wants to do something first). This node never touches
+Todoist. It only decides.
 
-- An `AIMessage` with **text** -- it has an answer for the user.
-- An `AIMessage` with **`tool_calls`** -- it wants to do something first.
-  Each tool call has a name, JSON arguments, and an id.
-
-This node never touches Todoist. It only decides.
+The Stage 2 addition is *which* Claude it sends to. `acting` has the five
+tools bound. `responding` is the same model with **no tools at all**, used when
+`observe` has decided the right move is to talk to the user. That turns "ask a
+clarifying question instead of guessing" from a prompt instruction into a
+guarantee: on a respond turn the model cannot emit a tool call, so it cannot
+guess. The system prompt also gets a short mode note -- "follow the repair note
+exactly" on a retry turn; "you cannot use tools this turn, ask one question or
+report the failure" on a respond turn.
 
 The system prompt is prepended on every call rather than stored in state, so
-it isn't duplicated each time round the loop, and so it always carries the
-current date -- which Claude needs to sanity-check and echo back things like
-"tomorrow at 3pm".
+it isn't duplicated each time round the loop and always carries the current
+date.
 
 ### `_route` -- the loop
 
@@ -128,79 +140,168 @@ def _route(state):
     return "tools"
 ```
 
-A conditional edge is just a function that looks at the state and names the
-next node. If Claude answered in text, we're done. If it asked for tools, go
-run them. The step cap (6 by default) stops a confused model from looping on
-your token bill; `run()` turns that case into an honest "I got stuck" rather
-than an empty reply.
+A conditional edge is a function that looks at the state and names the next
+node. Text means done; tool calls mean go run them. The step cap (6 by default)
+stops a confused model from looping on your token bill; `run()` turns that case
+into an honest "I got stuck" rather than an empty reply.
 
-### `tools` -- the act + observe step
+### `tools` -- the act step
 
 ```python
-def _tool_node(state):
-    observations = []
-    for call in state["messages"][-1].tool_calls:
-        try:
-            content, status = str(tool.invoke(call["args"])), "success"
-        except Exception as exc:
-            content, status = f"{type(exc).__name__}: {exc}", "error"
-        observations.append(ToolMessage(content=content, tool_call_id=call["id"], status=status))
-    return {"messages": observations}
+try:
+    content, status = str(tool.invoke(call["args"])), "success"
+    artifact = {"outcome": "ok"}
+except NeedsClarification as exc:
+    content, artifact = str(exc), {"outcome": "clarify"}
+except UnexpectedResult as exc:
+    content, artifact = str(exc), {"outcome": "unexpected", "repair": exc.repair}
+except todoist.TodoistError as exc:
+    content, artifact = str(exc), {"outcome": "api_error", "status_code": exc.status_code}
+except Exception as exc:
+    content, artifact = f"{type(exc).__name__}: {exc}", {"outcome": "crash"}
+observations.append(ToolMessage(content=content, tool_call_id=call["id"],
+                                status=status, artifact=artifact))
 ```
 
 Run each tool Claude asked for and append one `ToolMessage` per call, matched
-back by `tool_call_id`. Then the edge sends us back to `agent`, where Claude
-reads what happened and decides again.
+back by `tool_call_id`. Two things are deliberate. **Nothing raises out of this
+node** -- a failure is an observation like any other. And **this node decides
+nothing.** It records what happened on two channels: `content`, the readable
+result the model sees, and `artifact`, a structured record of the *kind* of
+outcome that the model never sees (LangChain keeps `artifact` out of the API
+request). The kind comes from which exception the tool raised -- which is why
+the tools raise typed failures, not generic ones.
 
-The important design decision is in the `except`: **nothing raises out of this
-node**. A failed tool call becomes a `ToolMessage` with `status="error"` whose
-content is the error text. From the loop's point of view a failure and a
-success are the same kind of thing -- an observation -- and they flow through
-the same path back to Claude. That is the entire mechanism behind "retry with
-corrected input or ask a clarifying question": there is no separate
-error-handling branch, just a model that gets told the truth and asked again.
+### `observe` -- the replan step
+
+This is the new node, and it answers the question that matters: after a tool
+call, how does the loop decide between *retry*, *ask me*, and *done*?
+
+The decision is a pure function, `classify(artifact, retries_used)`, so it
+reads as a table:
+
+| The tool reported                                | Meaning                                                | Budget left                          | Budget spent |
+| ------------------------------------------------ | ------------------------------------------------------ | ------------------------------------ | ------------ |
+| `ok`                                             | It worked                                              | **done**                             | done         |
+| `clarify` -- ambiguous, not found, missing info  | Only the user can resolve it                           | **ask**                              | ask          |
+| `unexpected` -- 200, but the result is wrong     | A corrected call can fix it; the world already changed | **retry** via the tool's repair note | ask          |
+| `bad_args` -- the model passed invalid arguments | The model can fix its own input                        | **retry**                            | ask          |
+| `api_error` 400                                  | Todoist rejected something in the input                | **retry**, corrected                 | ask          |
+| `api_error` 404                                  | The task is gone                                       | **ask**                              | ask          |
+| `api_error` 401 / 403                            | Credentials; nothing to retry                          | **fail**                             | fail         |
+| `api_error` 429 / 5xx / no status                | Transient                                              | **retry**, same input, after a pause | fail         |
+| `crash` -- unknown tool, a bug                   | Not the user's problem to solve                        | **fail**                             | fail         |
+
+Read top to bottom the questions are: *Did it work? Is this something only the
+user can resolve? Could a corrected or repeated call fix it, and is there
+budget? Otherwise fail, honestly.* "Ask" and "fail" both end the tool loop for
+this message; they differ only in what the model is told to say.
+
+Three decisions in there are worth being able to defend:
+
+**The budget is one retry per message.** A second identical failure is
+information, not bad luck, and the user should hear about it. It also means the
+loop can never oscillate between two failing calls. (`NEXUS_MAX_RETRIES`.)
+
+**A retry is not always a redo.** The `unexpected` row is the interesting one.
+`create_task("Call mum", due_string="sometime soonish")` returns 200 and a task
+*with no due date* -- Todoist dropped what it couldn't parse. The task now
+exists. Calling `create_task` again with a better date would create it twice.
+So the tool raises `UnexpectedResult` with a *repair*: "the task already exists
+as id 900 -- call `update_task` with a simpler due string". The verdict carries
+that note to the model. This is what "check whether it actually returned what
+was expected, not just that the API didn't error" looks like in code: the tool
+verifies the response against the request, and the failure knows how to be
+fixed.
+
+**The model executes the verdict; it doesn't choose it.** The verdict's note is
+appended to the tool result (`Observer: RETRY once. ...`) so the model knows
+what to do, and its action sets `mode`, which the *graph* enforces: `respond`
+binds no tools. Claude decides *how* -- the corrected call, the wording of the
+question, the phrasing of the failure. The policy is code, in one place, with
+a table-driven test.
 
 ### What that looks like in practice
 
-The tools are written to make good observations. They raise on failure (never
-return a cheerful string for something that didn't happen), and when something
-is ambiguous they raise *with the options included*. So with two tasks
-containing "review":
+Ambiguous reference -- an **ask** verdict:
 
 ```
 You      mark the review done
 
-agent    Claude -> complete_task(task="review")
-tools    LookupError: 'review' matches 2 open tasks:
+agent    complete_task(task="review")
+tools    'review' matches 2 open tasks:
              [1] Submit iTrade PR review
              [2] Review the design doc
-           Ask the user which one they meant. Do not guess.
-           (appended as ToolMessage, status="error")
-agent    Claude reads that, replies in text
-_route   no tool calls -> END
+         Ask the user which one they meant. Do not guess.
+observe  clarify -> ask.  mode = respond
+         (appends "Observer: only the user can resolve this; ask them, do not retry.")
+agent    no tools bound this turn -> can only reply in text
 
 Nexus    Which one - the iTrade PR review or the design doc review?
 ```
 
-Or, when it can fix the problem itself:
+Unparseable date -- a **retry** verdict whose repair is an update, not a redo:
 
 ```
-You      mark the PR review done          (only one task matches "pr review")
+You      remind me to call mum sometime soonish
 
-agent    complete_task(task="pr review")
-tools    Completed [1] Submit iTrade PR review        (status="success")
-agent    "Done - completed 'Submit iTrade PR review'."
+agent    create_task(content="Call mum", due_string="sometime soonish")
+tools    Created [900] Call mum, but Todoist did not understand the due date
+         'sometime soonish', so the task has NO due date.
+observe  unexpected -> retry (1 of 1).  mode = retry
+         (appends "Observer: RETRY once. The task already exists as id 900 --
+          do not call create_task again. Call update_task with task='900' ...")
+agent    update_task(task="900", due_string="next monday")     <- not create_task
+tools    Updated [900] Call mum (due 2026-09-14)
+observe  ok -> done.  mode = act
+agent    "Added 'Call mum' for next Monday - Todoist couldn't read 'sometime
+          soonish'. Say if you meant a different day."
 ```
 
-And the case where Todoist quietly accepts a task but can't parse the date:
-`create_task` notices the missing `due` field in the response and returns
-"Created ... but Todoist could not understand the due date 'sometime soonish',
-so the task has no due date" -- so Claude tells you that instead of confirming
-a due date that doesn't exist.
+A task that doesn't exist -- **ask**, and never an invented id:
 
-The tests in [`tests/test_agent.py`](tests/test_agent.py) walk through each of
-these paths with a scripted model, including the retry (round one ambiguous,
-round two uses the id from the error, round three confirms).
+```
+You      mark the PR review done          (no such open task)
+
+agent    complete_task(task="PR review")
+tools    No open task matches 'PR review'. The open tasks are: ...
+         Tell the user you could not find it and ask which one they meant.
+observe  clarify -> ask.  mode = respond
+Nexus    I can't find a task like "PR review" - your open ones are Buy milk and
+         Walk the dog. Which did you mean?
+```
+
+Rate limit -- **retry** the same call after a pause, then **fail** honestly:
+
+```
+tools    Todoist rejected the request: HTTP 429 - rate limited
+observe  api_error 429 -> retry, with backoff.  sleeps RETRY_BACKOFF_SECONDS
+agent    the same call again
+tools    HTTP 429 again
+observe  budget spent -> fail.  mode = respond
+Nexus    Todoist isn't responding right now (rate limited). Try again in a minute.
+```
+
+Each of these is a test in [`tests/test_replan.py`](tests/test_replan.py) with
+a scripted model and an in-memory Todoist -- including the assertion that the
+retry after a dropped due date calls `update_task` and leaves exactly one task.
+
+### What the observe step *cannot* check
+
+Pre-tool ambiguity. "Remind me about the thing" never reaches a tool, so there
+is no artifact to classify -- whether to ask, or to create a task called "the
+thing", is Claude's judgment, steered by the prompt ("never create a task whose
+content is a placeholder"). The one deterministic guard is that `create_task`
+rejects empty content. Testing the judgment itself needs the real model, which
+is what Stage 5's eval harness is for.
+
+### The clarifying-question caveat
+
+There is no memory between messages. When Nexus asks "which one?", your answer
+arrives as a *new* run that has never seen the question. Answers have to stand
+on their own -- "complete the iTrade one", not "the first one". The fix is
+LangGraph's checkpointer (a few lines; see the last section), and it is the
+first thing to add when memory arrives in Stage 4.
 
 ## Project layout
 
@@ -210,11 +311,11 @@ package.
 | File                | What it does                                                        |
 | ------------------- | ------------------------------------------------------------------- |
 | `bot.py`            | Telegram polling loop. Hands each message to the agent, replies.    |
-| `agent.py`          | The LangGraph graph: state, the two nodes, routing, `run()`.        |
-| `tools.py`          | `create_task`, `list_tasks`, `complete_task` as LangChain tools.    |
+| `agent.py`          | The graph: state, the three nodes, the `classify` table, `run()`.   |
+| `tools.py`          | The five Todoist tools, raising typed failures that `observe` reads.|
 | `todoist.py`        | Thin HTTP client for the three Todoist calls. Raises `TodoistError`.|
 | `config.py`         | Reads `.env`. Nothing raises on import; `bot.py` validates at start.|
-| `tests/`            | The test suite. `support.py` holds the fakes, `conftest.py` the fixtures. |
+| `tests/`            | The suite. `support.py` has the fakes, `conftest.py` the fixtures, `test_replan.py` Stage 2. |
 | `Dockerfile`        | Runs the bot as a worker. Used by any host that takes a Dockerfile. |
 | `Procfile`          | Same thing for buildpack/nixpacks hosts. Declares a `worker`, not a `web`. |
 
@@ -348,16 +449,17 @@ deploy.
 ## What's deliberately not here (yet)
 
 Each of these would be a small, contained change. They're left out because
-the point of Week 1 is understanding the loop, not accreting features.
+the point of these first stages is understanding the loop, not accreting features.
 
 - **Memory across messages.** LangGraph does this with a *checkpointer*:
   `graph.compile(checkpointer=MemorySaver())` and pass
   `config={"configurable": {"thread_id": chat_id}}` to `invoke`. The state
-  then persists per chat and "the second one" would mean something. The cost
-  is that context grows every message and you need a policy for trimming it.
+  then persists per chat, "the second one" would mean something, and a
+  clarifying question could actually be answered. The cost is that context
+  grows every message and you need a policy for trimming it.
 - **Proactive / scheduled messages** ("remind me at 3pm" that pings *you*).
   Needs a job runner alongside the polling loop and a way for the agent to
-  register jobs -- a fourth tool plus something like APScheduler.
+  register jobs -- a sixth tool plus something like APScheduler.
 - **Multi-step planning.** The loop already handles "list, then complete the
   one that matches" because Claude chains tool calls itself. A planner node
   that writes down a plan first only pays off once tasks get long enough that

@@ -3,8 +3,15 @@
 import pytest
 
 import agent
+import config
 import todoist
 from tests.support import FakeTodoist, HTTPRecorder
+
+
+@pytest.fixture(autouse=True)
+def no_backoff(monkeypatch):
+    """A transient-error retry pauses for RETRY_BACKOFF_SECONDS. Not in tests."""
+    monkeypatch.setattr(config, "RETRY_BACKOFF_SECONDS", 0)
 
 
 @pytest.fixture
