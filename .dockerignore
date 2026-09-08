@@ -1,0 +1,14 @@
+# Secrets never belong in an image -- tokens come from the platform's env vars.
+.env
+
+.git
+.github
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.coverage
+coverage.xml
+tests
+*.md

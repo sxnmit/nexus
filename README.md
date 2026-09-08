@@ -215,6 +215,8 @@ package.
 | `todoist.py`        | Thin HTTP client for the three Todoist calls. Raises `TodoistError`.|
 | `config.py`         | Reads `.env`. Nothing raises on import; `bot.py` validates at start.|
 | `tests/`            | The test suite. `support.py` holds the fakes, `conftest.py` the fixtures. |
+| `Dockerfile`        | Runs the bot as a worker. Used by any host that takes a Dockerfile. |
+| `Procfile`          | Same thing for buildpack/nixpacks hosts. Declares a `worker`, not a `web`. |
 
 The stack: [LangGraph](https://langchain-ai.github.io/langgraph/) for the loop,
 `langchain-anthropic` (which wraps the official `anthropic` SDK) for the model,
@@ -277,6 +279,71 @@ adaptive thinking by default (and reject `temperature` alongside it), and
 thinking tokens count against `max_tokens`, so raise `NEXUS_MAX_TOKENS` to
 ~8192 when you switch. `run()` already handles the block-style content a
 thinking model returns.
+
+## Deploying
+
+Nexus is a **worker**, not a website: one long-lived process that polls Telegram
+and opens no HTTP port. Everything below follows from that.
+
+`bot.py` needs no changes to run in production. It reads `.env` if one exists
+and falls back to real environment variables, so setting the tokens in your
+host's dashboard is enough -- and the `.env` file itself must never be baked
+into an image (`.dockerignore` excludes it).
+
+### Two rules that matter more than the host you pick
+
+**Deploy it as a worker / background service, not a web service.** A web
+service gets health-checked on a port Nexus never opens, so the platform will
+declare it unhealthy and restart it forever.
+
+**Run exactly one instance.** Telegram allows a single `getUpdates` consumer per
+bot. A second replica makes both of them fail with `Conflict: terminated by
+other getUpdates request`, and your messages get split or dropped. So: no
+autoscaling, replicas = 1. This is the one thing that silently breaks a
+polling bot in production.
+
+### On any of the usual hosts
+
+[Railway](https://railway.app), [Render](https://render.com), and
+[Fly.io](https://fly.io) all work the same way:
+
+1. Point the host at this repo. Railway and Fly will use the `Dockerfile`;
+   Render can use it or its native Python runtime.
+2. Create the service as a **worker** (Render calls it a Background Worker;
+   Railway just runs the `Procfile`'s `worker` process; on Fly, leave the
+   `[http_service]` block out of `fly.toml` entirely).
+3. Add the environment variables from your `.env` -- at minimum the three
+   tokens, plus `ANTHROPIC_WORKSPACE_ID` if your Claude key needs it.
+4. Confirm the instance count is 1.
+5. Deploy, then read the logs.
+
+A healthy start looks exactly like it does locally:
+
+```
+Todoist OK - 50 open task(s). Model: claude-haiku-4-5
+Claude OK.
+Nexus is polling. Ctrl-C to stop.
+```
+
+If a token is wrong the process exits immediately with the reason, so a crash
+loop in the logs will tell you which one rather than leaving you guessing.
+
+### Set the allowlist before you deploy
+
+Locally an unlocked bot is a small risk. Deployed, it runs 24/7 against your
+real Todoist, and anyone who guesses the bot's username can talk to it. Set
+`TELEGRAM_ALLOWED_USER_IDS` -- see [Lock it down](#lock-it-down). The bot logs a
+warning at startup while it is unset.
+
+### Running it locally with Docker
+
+```bash
+docker build -t nexus .
+docker run --rm --env-file .env nexus
+```
+
+That is the same image the host runs, so it is worth doing once before you
+deploy.
 
 ## What's deliberately not here (yet)
 
