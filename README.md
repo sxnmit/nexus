@@ -62,7 +62,8 @@ recorded `httpx` layer that returns real `Response` objects). Coverage is
 enforced at 95% and a deprecated LangChain call fails the run.
 
 [CI](.github/workflows/ci.yml) runs lint, formatting and the tests on every
-push and pull request, across Python 3.11-3.13.
+push and pull request, across Python 3.11-3.13 -- plus a job that builds the
+Docker image and boots it with placeholder tokens.
 
 ## How the agent loop works
 
@@ -429,6 +430,35 @@ Nexus is polling. Ctrl-C to stop.
 If a token is wrong the process exits immediately with the reason, so a crash
 loop in the logs will tell you which one rather than leaving you guessing.
 
+### Railway, step by step
+
+Railway is the least ceremony for a worker: it finds the `Dockerfile`, builds
+it, and runs its `CMD`. There is no service type to choose and no health check
+to dodge.
+
+1. **New Project -> Deploy from GitHub repo** and pick this repo. Railway
+   detects the `Dockerfile` and starts a build. The first deploy will crash-loop
+   until step 2 -- `bot.py` exits with "Missing environment variables" -- and
+   that is expected.
+2. In the service, open **Variables** and add the contents of your `.env`:
+   `PERSONAL_ACCESS_TOKEN_CLAUDE`, `API_TOKEN_TODOIST`, `API_TOKEN_TELEGRAM`,
+   `ANTHROPIC_WORKSPACE_ID` if your key needs it, and
+   `TELEGRAM_ALLOWED_USER_IDS`. Railway redeploys when variables change.
+3. In **Settings**, confirm **1 replica** and no public domain or port -- Nexus
+   serves nothing. Leave the restart policy on its default, restart on failure.
+4. **Stop the bot on your laptop** before this deploy finishes. Two pollers on
+   one bot token fight over updates.
+5. Open the deployment's **Logs**. A good start is the same three lines as
+   local -- `Todoist OK`, `Claude OK.`, `Nexus is polling.` -- then message the
+   bot.
+
+From here every push to `main` redeploys: CI green, merge, live.
+
+Railway's docs could not be opened from the sandbox this was written in, so
+the menu names above are from memory. The invariants are what matter -- the
+variables on the service, one replica, no port -- and the logs tell you the
+rest.
+
 ### Set the allowlist before you deploy
 
 Locally an unlocked bot is a small risk. Deployed, it runs 24/7 against your
@@ -444,7 +474,9 @@ docker run --rm --env-file .env nexus
 ```
 
 That is the same image the host runs, so it is worth doing once before you
-deploy.
+deploy. CI builds it on every push too, and boots it with placeholder tokens
+to prove it gets as far as the startup checks -- so a broken `Dockerfile`
+turns the build red before it ever reaches a host.
 
 ## What's deliberately not here (yet)
 
