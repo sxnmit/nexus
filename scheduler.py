@@ -7,9 +7,10 @@ rules that are deliberately few:
      about what the user might want. The morning and evening jobs fire because
      a configured time passed; a nudge fires because a task crossed from due to
      overdue.
-  2. A transition is reported once. The nudge job remembers what it has
-     nudged. The morning check-in may list an overdue task again tomorrow, but
-     that is the day's anchor, not a repeat of the same event.
+  2. A transition is reported once. Every job records what it has reported --
+     per task *and* per due date, so a task that was pushed to a new time is
+     a new transition. The morning check-in may list an overdue task again
+     tomorrow, but that is the day's anchor, not a repeat of the same event.
   3. Silence when there is nothing to say -- except the morning check-in, which
      is the anchor and always sends.
   4. Quiet hours are absolute for proactive messages and irrelevant for
@@ -18,13 +19,14 @@ rules that are deliberately few:
 
 The messages are templates, not model output. They are reports; the agent loop
 is for requests; and a template cannot hallucinate a task. Your reply to a
-check-in goes through the normal agent with all five tools, so "push the PR
-review to tomorrow" just works.
+check-in goes through the normal agent with all five tools -- and with the
+check-in in its conversation memory, so "push it to tomorrow" just works.
 
-Two limits worth knowing, both fixed by the persistent log in Stage 4:
-the evening "done vs still open" is a diff against the morning snapshot, so it
-lives in memory (a restart mid-day loses it, and the evening message says so),
-and the nudge job's memory of what it has nudged is in-process too.
+Memory adds one thing to each report: a sentence of advice for a task the
+counters say keeps slipping or usually runs late ("drop it, or give it a fixed
+slot?"). That is a template too, filled from integers, so it stays honest. And
+the morning snapshot and the record of what has been reported live in the same
+database, so a restart between the jobs loses neither.
 """
 
 import asyncio
@@ -35,6 +37,7 @@ from datetime import date, datetime, time, timedelta
 
 import config
 import todoist
+from memory import Memory
 
 log = logging.getLogger("nexus.proactive")
 
@@ -67,42 +70,14 @@ class Window:
         return wall >= self.start or wall < self.end  # crosses midnight
 
 
-# --- Reading Todoist's due fields --------------------------------------------------
-
-
-def _parse_due(task: dict) -> tuple[date | None, datetime | None]:
-    """(calendar day, exact moment) for a task, in the configured timezone.
-
-    Todoist gives `due.date` as a calendar day and, for tasks with a time,
-    `due.datetime` as RFC 3339 -- UTC with a Z, or a floating local time with
-    no zone. Some API versions put the timestamp in `date` itself. All three
-    shapes end up here as an aware datetime in NEXUS_TIMEZONE, or None for a
-    task with a day but no time.
-    """
-    due = task.get("due") or {}
-    raw_date = due.get("date") or ""
-    raw_dt = due.get("datetime") or (raw_date if "T" in raw_date else None)
-
-    when = None
-    if raw_dt:
-        when = datetime.fromisoformat(raw_dt.replace("Z", "+00:00"))
-        if when.tzinfo is None:
-            when = when.replace(tzinfo=config.TIMEZONE)  # floating: it means local
-        else:
-            when = when.astimezone(config.TIMEZONE)
-
-    if when is not None:
-        return when.date(), when
-    if raw_date:
-        return date.fromisoformat(raw_date[:10]), None
-    return None, None
+# --- Sorting tasks by day -------------------------------------------------------------
 
 
 def _split(tasks: list[dict], today: date) -> tuple[list[dict], list[dict]]:
     """Open tasks due today, and open tasks due before today."""
     due_today, overdue = [], []
     for task in tasks:
-        day, _ = _parse_due(task)
+        day, _ = todoist.parse_due(task)
         if day == today:
             due_today.append(task)
         elif day is not None and day < today:
@@ -132,7 +107,7 @@ def _ago(delta: timedelta) -> str:
 
 def _line(task: dict, today: date) -> str:
     """One human line per task: name, then time / how overdue / priority."""
-    day, when = _parse_due(task)
+    day, when = todoist.parse_due(task)
     bits = []
     if when is not None and day == today:
         bits.append(_clock(when))
@@ -192,6 +167,11 @@ def nudge_text(fresh: list[tuple[datetime, dict]], now: datetime) -> str:
     return f"Overdue ({len(fresh)}):\n" + "\n".join(lines) + "\n\nDone, or push them?"
 
 
+def with_advice(text: str, advice: list[str]) -> str:
+    """A report, then the habits worth a word -- as a paragraph of its own."""
+    return text if not advice else text + "\n\n" + "\n".join(advice)
+
+
 # --- The gate and the three jobs --------------------------------------------------
 
 
@@ -203,16 +183,25 @@ class Proactive:
         send: Sender,
         chat_id: int | None,
         quiet: Window,
+        memory: Memory,
         clock: Callable[[], datetime] | None = None,
     ):
         self.send = send
         self.chat_id = chat_id
         self.quiet = quiet
+        self.memory = memory
         self._clock = clock  # tests inject a fake clock
         self.started_at = self.now()
-        self.snapshot: dict[str, dict] | None = None  # what the morning check-in saw
-        self.snapshot_at: datetime | None = None
-        self.nudged: set[str] = set()  # task ids already reported by any job
+
+        # What the morning check-in saw, and what any job has already reported
+        # (task id -> the due date it was reported with). Both come back from
+        # the database, so a restart mid-day changes nothing.
+        saved = memory.load("morning_snapshot")
+        self.snapshot: dict[str, dict] | None = saved["tasks"] if saved else None
+        self.snapshot_at: datetime | None = (
+            datetime.fromisoformat(saved["at"]).astimezone(config.TIMEZONE) if saved else None
+        )
+        self.reported: dict[str, str] = memory.load("reported", {})
 
     @property
     def enabled(self) -> bool:
@@ -231,9 +220,20 @@ class Proactive:
         if self.quiet.is_quiet(now):
             log.info("%s: held - quiet hours (%s)", kind, now.strftime("%H:%M"))
             return False
-        await self.send(self.chat_id, text[:MAX_MESSAGE])
+        sent = text[:MAX_MESSAGE]
+        await self.send(self.chat_id, sent)
+        # Part of the conversation now: the user's next message may refer to it.
+        self.memory.log(self.chat_id, "assistant", sent, kind=kind)
         log.info("%s: sent", kind)
         return True
+
+    def _is_reported(self, task: dict) -> bool:
+        return self.reported.get(_task_id(task)) == todoist.due_key(task)
+
+    def _mark_reported(self, tasks: list[dict]) -> None:
+        for task in tasks:
+            self.reported[_task_id(task)] = todoist.due_key(task)
+        self.memory.save("reported", self.reported)
 
     async def _open_tasks(self) -> list[dict]:
         # The Todoist client is synchronous; keep it off the event loop.
@@ -252,9 +252,18 @@ class Proactive:
         due_today, overdue = _split(tasks, today)
         self.snapshot = {_task_id(task): task for task in due_today + overdue}
         self.snapshot_at = now
+        self.memory.save("morning_snapshot", {"at": now.isoformat(), "tasks": self.snapshot})
+
         # Rule 2: these are reported now, so the nudge job must not repeat them.
-        self.nudged.update(self.snapshot)
-        await self.deliver("morning", morning_text(due_today, overdue, today))
+        # And a task no longer open has nothing left to report; forget it.
+        open_ids = {_task_id(task) for task in tasks}
+        self.reported = {tid: due for tid, due in self.reported.items() if tid in open_ids}
+        self._mark_reported(due_today + overdue)
+
+        text = morning_text(due_today, overdue, today)
+        await self.deliver(
+            "morning", with_advice(text, self.memory.advice_for(due_today + overdue))
+        )
 
     async def evening_review(self) -> None:
         """Done vs still open, diffed against the morning snapshot."""
@@ -281,8 +290,9 @@ class Proactive:
             log.info("evening: nothing to review")  # rule 3
             return
 
-        self.nudged.update(_task_id(task) for task in still_open)
-        await self.deliver("evening", evening_text(done, still_open, today, started_at))
+        self._mark_reported(still_open)
+        text = evening_text(done, still_open, today, started_at)
+        await self.deliver("evening", with_advice(text, self.memory.advice_for(still_open)))
 
     async def overdue_nudge(self) -> None:
         """Timed tasks that just went overdue, each reported once."""
@@ -295,8 +305,8 @@ class Proactive:
 
         fresh = []
         for task in tasks:
-            _, when = _parse_due(task)
-            if when is None or _task_id(task) in self.nudged:
+            _, when = todoist.parse_due(task)
+            if when is None or self._is_reported(task):
                 continue
             if when <= now <= when + NUDGE_LOOKBACK:
                 fresh.append((when, task))
@@ -304,10 +314,12 @@ class Proactive:
             return
 
         fresh.sort(key=lambda pair: pair[0])
-        if await self.deliver("nudge", nudge_text(fresh, now)):
-            # Rule 4: only what was actually sent counts as nudged. Held in
+        overdue = [task for _, task in fresh]
+        text = with_advice(nudge_text(fresh, now), self.memory.advice_for(overdue))
+        if await self.deliver("nudge", text):
+            # Rule 4: only what was actually sent counts as reported. Held in
             # quiet hours -> tried again next check.
-            self.nudged.update(_task_id(task) for _, task in fresh)
+            self._mark_reported(overdue)
 
 
 # --- Wiring into the bot -----------------------------------------------------------

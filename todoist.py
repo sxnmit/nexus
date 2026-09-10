@@ -6,6 +6,8 @@ because the agent's observe step decides what to do next from it: a 429 is
 worth one retry, a 401 is not.
 """
 
+from datetime import date, datetime
+
 import httpx
 
 import config
@@ -102,3 +104,41 @@ def delete_task(task_id: str) -> None:
 def close_task(task_id: str) -> None:
     """Mark a task complete. Returns 204 with an empty body on success."""
     _request("POST", f"/tasks/{task_id}/close")
+
+
+# --- Reading a task's due fields ------------------------------------------------------
+
+
+def parse_due(task: dict) -> tuple[date | None, datetime | None]:
+    """(calendar day, exact moment) for a task, in the configured timezone.
+
+    Todoist gives `due.date` as a calendar day and, for tasks with a time,
+    `due.datetime` as RFC 3339 -- UTC with a Z, or a floating local time with
+    no zone. Some API versions put the timestamp in `date` itself. All three
+    shapes end up here as an aware datetime in NEXUS_TIMEZONE, or None for a
+    task with a day but no time.
+    """
+    due = task.get("due") or {}
+    raw_date = due.get("date") or ""
+    raw_dt = due.get("datetime") or (raw_date if "T" in raw_date else None)
+
+    when = None
+    if raw_dt:
+        when = datetime.fromisoformat(raw_dt.replace("Z", "+00:00"))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=config.TIMEZONE)  # floating: it means local
+        else:
+            when = when.astimezone(config.TIMEZONE)
+
+    if when is not None:
+        return when.date(), when
+    if raw_date:
+        return date.fromisoformat(raw_date[:10]), None
+    return None, None
+
+
+def due_key(task: dict) -> str:
+    """The due date exactly as Todoist states it, or "" -- for telling "the same
+    task, moved" from "the same task"."""
+    due = task.get("due") or {}
+    return due.get("datetime") or due.get("date") or ""

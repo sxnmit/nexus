@@ -5,6 +5,7 @@ either an in-memory fake (for the tools and the agent) or a recorded HTTP layer
 that hands back real httpx.Response objects (for the client itself).
 """
 
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -217,3 +218,20 @@ def tool_calls(*specs):
             for i, (name, args) in enumerate(specs)
         ],
     )
+
+
+def log_rows(memory):
+    """The interaction log as dicts, oldest first, with the JSON detail parsed."""
+    rows = memory._db.execute(
+        "SELECT chat_id, role, kind, text, detail FROM interactions ORDER BY id"
+    ).fetchall()
+    return [
+        {
+            "chat_id": row["chat_id"],
+            "role": row["role"],
+            "kind": row["kind"],
+            "text": row["text"],
+            "detail": json.loads(row["detail"]) if row["detail"] else None,
+        }
+        for row in rows
+    ]

@@ -89,4 +89,8 @@ jobs:
             echo "::error::expected the Todoist startup check to be what stopped it"
             exit 1
           fi
+          if ! printf '%s\n' "$output" | grep -q "Memory: /data/nexus.db"; then
+            echo "::error::the memory database did not open at /data/nexus.db inside the image"
+            exit 1
+          fi
           echo "OK: the image boots and stops at the Todoist check, as it must without real tokens"

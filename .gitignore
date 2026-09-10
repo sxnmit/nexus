@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Nexus: the memory database is personal data
+*.db
+*.db-journal

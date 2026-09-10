@@ -1,7 +1,11 @@
 """The five tools the agent can call.
 
-Each returns a short string that goes straight back into the conversation as an
-observation, so the wording is aimed at the model, not at a log file.
+Each returns two things: a short string that goes straight back into the
+conversation as an observation (so the wording is aimed at the model, not at a
+log file), and an *event* -- the task as Todoist returned it, or before and
+after an update -- that the model never sees. LangChain calls the second part
+the artifact. The agent loop hands events to memory, which is how "you've moved
+gym four times" gets counted without the tools knowing memory exists.
 
 Three rules make the observe step in agent.py work:
 
@@ -36,11 +40,15 @@ class UnexpectedResult(Exception):
     `repair` says what a corrected attempt should look like. It matters because
     the naive retry is often wrong: re-running create_task after Todoist dropped
     the due date would create the task twice.
+
+    `event` is what *did* happen, for memory: a task created with the wrong
+    date is still a task created.
     """
 
-    def __init__(self, message: str, repair: str):
+    def __init__(self, message: str, repair: str, event: dict | None = None):
         super().__init__(message)
         self.repair = repair
+        self.event = event
 
 
 # Todoist's API scores priority 1 (normal) to 4 (urgent); the app shows the
@@ -99,8 +107,8 @@ def _find_task(reference: str, verb: str) -> dict:
     return matches[0]
 
 
-@tool(parse_docstring=True)
-def create_task(content: str, due_string: str = "") -> str:
+@tool(parse_docstring=True, response_format="content_and_artifact")
+def create_task(content: str, due_string: str = "") -> tuple[str, dict]:
     """Create a new task in the user's Todoist.
 
     Args:
@@ -116,6 +124,7 @@ def create_task(content: str, due_string: str = "") -> str:
         raise NeedsClarification("The task has no content. Ask the user what the task is.")
 
     task = todoist.create_task(content.strip(), due_string or None)
+    event = {"kind": "created", "task": task}
 
     if due_string and not task.get("due"):
         # Todoist accepted the task but silently dropped a due date it could not
@@ -129,22 +138,23 @@ def create_task(content: str, due_string: str = "") -> str:
                 f"a simpler due_string such as 'tomorrow at 3pm' or 'next monday', or "
                 f"ask the user how to phrase the date."
             ),
+            event=event,
         )
 
-    return f"Created {_format_task(task)}"
+    return f"Created {_format_task(task)}", event
 
 
-@tool(parse_docstring=True)
-def list_tasks() -> str:
+@tool(parse_docstring=True, response_format="content_and_artifact")
+def list_tasks() -> tuple[str, None]:
     """List the user's open (not yet completed) Todoist tasks."""
     tasks = todoist.get_tasks()
     if not tasks:
-        return "There are no open tasks."
-    return "Open tasks:\n" + "\n".join(_format_task(task) for task in tasks)
+        return "There are no open tasks.", None
+    return "Open tasks:\n" + "\n".join(_format_task(task) for task in tasks), None
 
 
-@tool(parse_docstring=True)
-def complete_task(task: str) -> str:
+@tool(parse_docstring=True, response_format="content_and_artifact")
+def complete_task(task: str) -> tuple[str, dict]:
     """Mark one of the user's Todoist tasks as complete.
 
     Args:
@@ -153,11 +163,13 @@ def complete_task(task: str) -> str:
     """
     found = _find_task(task, "complete")
     todoist.close_task(found["id"])
-    return f"Completed {_format_task(found)}"
+    return f"Completed {_format_task(found)}", {"kind": "completed", "task": found}
 
 
-@tool(parse_docstring=True)
-def update_task(task: str, content: str = "", due_string: str = "", priority: int = 0) -> str:
+@tool(parse_docstring=True, response_format="content_and_artifact")
+def update_task(
+    task: str, content: str = "", due_string: str = "", priority: int = 0
+) -> tuple[str, dict]:
     """Change an existing task's name, due date and/or priority.
 
     Args:
@@ -204,6 +216,7 @@ def update_task(task: str, content: str = "", due_string: str = "", priority: in
         problems.append(f"the priority is still p{5 - (updated.get('priority') or 1)}")
 
     if problems:
+        # No event: a half-applied update is not a habit, and the repair follows.
         raise UnexpectedResult(
             f"Updated {_format_task(updated)}, but " + "; ".join(problems) + ".",
             repair=(
@@ -213,11 +226,15 @@ def update_task(task: str, content: str = "", due_string: str = "", priority: in
             ),
         )
 
-    return f"Updated {_format_task(updated)}"
+    return f"Updated {_format_task(updated)}", {
+        "kind": "updated",
+        "before": found,
+        "after": updated,
+    }
 
 
-@tool(parse_docstring=True)
-def delete_task(task: str) -> str:
+@tool(parse_docstring=True, response_format="content_and_artifact")
+def delete_task(task: str) -> tuple[str, dict]:
     """Delete a task permanently. This cannot be undone, so use it only when the
     user clearly asked to delete or remove a task, not to complete it.
 
@@ -226,7 +243,7 @@ def delete_task(task: str) -> str:
     """
     found = _find_task(task, "delete")
     todoist.delete_task(found["id"])
-    return f"Deleted {_format_task(found)}"
+    return f"Deleted {_format_task(found)}", {"kind": "deleted", "task": found}
 
 
 TOOLS = [create_task, list_tasks, complete_task, update_task, delete_task]

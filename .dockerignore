@@ -12,3 +12,7 @@ __pycache__
 coverage.xml
 tests
 *.md
+
+# A local memory database is personal and belongs on a volume, not in an image.
+*.db
+*.db-journal

@@ -1,8 +1,8 @@
 # Nexus
 
 A personal task assistant you message on Telegram. It runs a small LangGraph
-agent on Claude that manages your Todoist through three tools -- create a task,
-list open tasks, complete a task -- and replies in plain language.
+agent on Claude that manages your Todoist through five tools -- create, list,
+complete, update and delete tasks -- and replies in plain language.
 
 ```
 You:    remind me to submit the iTrade PR review tomorrow at 3pm
@@ -15,9 +15,11 @@ You:    mark the review done
 Nexus:  Done - completed 'Submit iTrade PR review'.
 ```
 
-This is the Week 1 cut: a real plan -> act -> observe loop, no memory between
-messages, no scheduling, no multi-step planning. See [What's deliberately not
-here](#whats-deliberately-not-here-yet) for how those would slot in.
+Four stages in: a real plan -> act -> observe loop, a replan step with an
+honest retry policy, scheduled check-ins with quiet hours, and a lightweight
+memory that remembers the conversation and learns a few habits. No multi-step
+planning yet -- see [What's deliberately not
+here](#whats-deliberately-not-here-yet).
 
 ## Quick start
 
@@ -37,7 +39,9 @@ python bot.py
 
 `bot.py` checks all three tokens and makes one test call to Todoist before it
 starts polling, so a bad token fails at startup rather than mid-conversation.
-Then open Telegram, find your bot, and send it a message.
+Then open Telegram, find your bot, and send it a message. The first run
+creates `nexus.db` next to the code: that is the bot's memory (see
+[Memory](#memory)); delete the file and it forgets everything.
 
 The `.env` names are exactly:
 
@@ -52,7 +56,7 @@ The `.env` names are exactly:
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                     # 96 tests, ~1s, no network, no tokens needed
+pytest                     # 326 tests, ~2s, no network, no tokens needed
 ruff check . && ruff format --check .
 ```
 
@@ -88,18 +92,20 @@ rather than one that hopes the model reacts well to errors.
 The graph carries a `MessagesState` -- a list of messages that only ever grows
 (LangGraph's `add_messages` reducer appends rather than replaces, except that a
 message with the same `id` replaces its predecessor, which `observe` relies
-on). Plus three fields:
+on). Plus four fields:
 
-| Field     | Meaning                                                          |
-| --------- | ---------------------------------------------------------------- |
-| `steps`   | Trips through the agent node this run. The loop cap.             |
-| `retries` | Retries the observe step has granted this run. The retry budget. |
-| `mode`    | What the *next* agent turn is for: `act`, `retry`, or `respond`. |
+| Field         | Meaning                                                                   |
+| ------------- | ------------------------------------------------------------------------- |
+| `steps`       | Trips through the agent node this run. The loop cap.                      |
+| `retries`     | Retries the observe step has granted this run. The retry budget.          |
+| `mode`        | What the *next* agent turn is for: `act`, `retry`, or `respond`.          |
+| `memory_note` | The habits relevant to this message, rendered for the prompt; often empty. |
 
-Every Telegram message starts with a fresh state containing only that one
-`HumanMessage`. By the time the run finishes the state holds the full
-exchange and then it's thrown away. That's what "no memory" means here -- and
-see the caveat about clarifying questions at the end of this section.
+Every Telegram message starts a fresh state: the last few messages of the
+chat, replayed from the log, then the new `HumanMessage` (see
+[Memory](#memory)). By the time the run finishes the state holds the full
+exchange; `run()` logs it and throws the state away. The graph itself never
+touches the database.
 
 ### `agent` -- the plan step
 
@@ -296,17 +302,17 @@ content is a placeholder"). The one deterministic guard is that `create_task`
 rejects empty content. Testing the judgment itself needs the real model, which
 is what Stage 5's eval harness is for.
 
-### The clarifying-question caveat
+### Answering a clarifying question
 
-There is no memory between messages. When Nexus asks "which one?", your answer
-arrives as a *new* run that has never seen the question. Answers have to stand
-on their own -- "complete the iTrade one", not "the first one". The fix is
-LangGraph's checkpointer (a few lines; see the last section), and it is the
-first thing to add when memory arrives in Stage 4.
+When Nexus asks "which one?", your answer arrives as a *new* run -- but since
+Stage 4 that run starts with the question in front of it. `run()` replays the
+last few messages of the chat before the new one (see [Memory](#memory)), so
+"the first one" means something. Until then every message was a fresh run and
+answers had to stand on their own.
 
 ## Project layout
 
-Flat on purpose -- it's a learning project, and six modules don't need a
+Flat on purpose -- it's a learning project, and seven modules don't need a
 package.
 
 | File                | What it does                                                        |
@@ -317,7 +323,8 @@ package.
 | `todoist.py`        | Thin HTTP client for the three Todoist calls. Raises `TodoistError`.|
 | `config.py`         | Reads `.env`. Nothing raises on import; `bot.py` validates at start.|
 | `scheduler.py`      | Stage 3: the quiet-hours gate and the three time-triggered jobs.   |
-| `tests/`            | The suite. `support.py` has the fakes, `conftest.py` the fixtures, `test_replan.py` Stage 2. |
+| `memory.py`         | Stage 4: the SQLite interaction log, the habit counters, and the scheduler's shelf. |
+| `tests/`            | The suite. `support.py` has the fakes, `conftest.py` the fixtures, `test_replan.py` Stage 2, `test_memory.py` Stage 4. |
 | `Dockerfile`        | Runs the bot as a worker. Used by any host that takes a Dockerfile. |
 | `Procfile`          | Same thing for buildpack/nixpacks hosts. Declares a `worker`, not a `web`. |
 
@@ -365,7 +372,7 @@ else. It warns at startup if this isn't set.
 ### Model
 
 `claude-haiku-4-5` by default (`NEXUS_MODEL` to override). Deciding which of
-three tools to call is a routing job, not a reasoning one, and Haiku is fast
+five tools to call is a routing job, not a reasoning one, and Haiku is fast
 and cheap at it.
 
 `max_tokens` is 1024 (`NEXUS_MAX_TOKENS` to override). That is a ceiling on
@@ -437,9 +444,11 @@ Proactive messages are written by templates, not by Claude. They are
 tested to the character, costs nothing at three sends a day, and cannot
 hallucinate a task. Your *reply* to a check-in goes through the normal agent
 with all five tools, so "push the PR review to tomorrow" works exactly as it
-does any other time. Claude joins proactive messaging in Stage 4, when there is
-a learned pattern worth phrasing -- "you've pushed gym four times this month;
-move it?" -- and phrasing is what a model is for.
+does any other time -- and, since Stage 4, with the check-in in its
+conversation memory, so "push it to tomorrow" works too. Memory adds one
+sentence per task the counters flag ("'Gym' keeps slipping (moved 4 times
+before). Drop it, or give it a fixed slot?"), and that is a template as well,
+filled from integers, for the same reason. See [Memory](#memory).
 
 ### Where "done vs still open" comes from
 
@@ -448,8 +457,9 @@ from where this was written, so the evening review doesn't need it. The morning
 check-in snapshots what's due; the evening diffs that against what is still
 open. Gone from the open list = done; still there = still open.
 
-Two limits follow, both fixed by the persistent log in Stage 4. The snapshot is
-in memory, so a restart between the two jobs loses it -- and the evening
+Two limits follow. The snapshot is saved to the memory database (Stage 4), so
+a restart between the two jobs no longer loses it; when there is no snapshot
+from today at all -- the bot was first started after 08:00 -- the evening
 message says so ("I started at 2:00pm, so I can't see what got done before
 that") rather than pretending nothing was done. And a task created *and*
 finished within the day is invisible to the diff.
@@ -461,8 +471,9 @@ hours -- and is exactly what the 08:00 check-in reports as overdue. Nudging it
 at 07:00 and listing it again at 08:00 is the nagging rule 2 exists to prevent.
 So the nudge job only watches tasks with a clock time ("was due 3:00pm, 20 min
 ago"), and only ones that went overdue in the last 24 hours, so a restart can't
-re-nudge last week. Tasks it has already nudged live in memory too; a restart
-may nudge a recent one twice. Stage 4.
+re-nudge last week. What it has reported is saved to the memory database, per
+task *and* per due date: a restart does not repeat a nudge, and a task you push
+to a new time is a new transition, nudged again when that time passes.
 
 ### Timezone
 
@@ -487,6 +498,122 @@ startup, so a wrong one shows up in the first line.
 A value that can't be parsed doesn't crash the import; `bot.py` reports every
 such setting at startup and refuses to run, which is where the mistake is
 cheapest.
+
+## Memory
+
+Stage 4 gives Nexus a memory: one SQLite file ([`memory.py`](memory.py),
+`NEXUS_DB_PATH`, default `nexus.db`), three tables, no embeddings.
+
+| Table          | What's in it                                                                                                                              |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `interactions` | Everything said and done, in order: your messages, every tool call with its arguments and outcome, every reply, every check-in.            |
+| `patterns`     | One row per *topic* with a handful of counters: added, moved (and how many of those to later), done (and how many late, by how much), deleted. |
+| `state`        | The scheduler's morning snapshot and what it has already reported, so a restart forgets neither.                                          |
+
+Two different kinds of memory come out of that, and they are worth keeping
+apart.
+
+### Conversation memory: the last few messages
+
+Before each run, `run()` pulls the last `NEXUS_MEMORY_MESSAGES` (10) user and
+assistant messages of the chat from the last `NEXUS_MEMORY_HOURS` (12) and
+puts them in front of the new one. Check-ins are logged as assistant messages,
+so the morning after "Due today: Gym (2:00pm)", "push it to tomorrow" works.
+Tool calls are left out: the replies already say what was done, and Haiku's
+context is better spent on the conversation than on transcripts.
+
+One wrinkle. Claude requires the first message to be the user's, and a window
+can open on a check-in the bot sent by itself. `run()` puts a
+`[scheduled check-in]` line in front when that happens, and the system prompt
+tells the model what that line stands for.
+
+Why not LangGraph's checkpointer? It is the idiomatic answer and it would have
+worked. But it persists the *whole* state -- every tool call and observer
+verdict, plus the `steps` and `retries` counters that must reset per message
+-- and it needs its own trimming policy, its own store and its own schema next
+to the interaction log this stage asks for anyway. The log already holds the
+conversation; replaying its tail is a dozen lines, and the policy (how many,
+how recent) is two settings you can read. Memory sits *around* the graph, in
+`run()`, so the graph stays pure and every test that ran without a database
+still does.
+
+### Habits: counters, not a model
+
+The five tools attach an *event* to every successful call -- the task as
+Todoist returned it, or before-and-after for an update -- in the ToolMessage's
+artifact, the same model-invisible side channel the observe step uses.
+`run()` hands each event to `Memory.learn()`, which updates one row:
+
+| Event                                                          | Counters                                                              |
+| -------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `create_task` succeeds (or creates the task but drops the date) | `created`                                                             |
+| `update_task` changes a due date                                | `rescheduled`; `pushed_later` too if the new date is later            |
+| `complete_task` succeeds                                        | `completed`; `completed_late` and `late_seconds` if it was past due   |
+| `delete_task` succeeds                                          | `deleted`                                                             |
+
+The row is keyed by *topic*: the task name lowercased, with articles, request
+verbs and anything that names a time stripped, first three words kept. "Go to
+the gym tomorrow" and "Gym" are both `gym`. That is deliberately simple; see
+below for what it cannot do.
+
+Three thresholds turn counters into something worth saying, and they are the
+only interpretation in the code:
+
+- **recurring** -- added 3 or more times
+- **keeps slipping** -- moved 2 or more times, at least half of them to later
+- **usually late** -- finished late 2 or more times, at least half the time
+
+Everything else -- "added once", "done twice, on time" -- stays a number in
+the table and is never mentioned.
+
+### Where the habits are read
+
+1. **The planning step.** `run()` looks up the topics your message (and the
+   recent messages) mention. If any are notable, the system prompt gets a
+   block:
+
+   ```
+   What you know about this user's habits (counts of what happened through you; nothing inferred):
+   - 'Gym': added 5 times (recurring); moved 4 times (4 to later)
+   Use a habit only when it changes your suggestion, in one short clause -- e.g. offer a
+   fixed slot for something they keep moving. Never nag, and never recite these unasked.
+   ```
+
+   So "add gym tomorrow" can come back as "Added 'Gym' for tomorrow. You've
+   moved it four times before -- want a fixed slot?". The model chooses the
+   wording; the numbers came from the table; and nothing is in the prompt
+   unless the message touched it.
+
+2. **The proactive templates.** The morning check-in, evening review and nudge
+   append one sentence per listed task whose topic keeps slipping or usually
+   runs late: `'Gym' keeps slipping (moved 4 times before, always later). Drop
+   it, or give it a fixed slot?` Still a template, so it still cannot
+   hallucinate -- and it is a suggestion, not a nag, which is the whole point
+   of knowing.
+
+3. **`/memory`** in Telegram prints the counts and the notable habits, so you
+   can see what it thinks it knows.
+
+### What it cannot see, and what would fix it
+
+- **Only what goes through Nexus counts.** Reschedule a task in the Todoist
+  app and nothing is learned. Diffing the morning snapshot's due dates against
+  the evening's would catch some of that; not built.
+- **Topics are keywords.** "Gym", "Workout" and "Go running" are three rows.
+  This is the one place embeddings-based retrieval would genuinely help --
+  clustering task names into categories -- and it is flagged, not built, as
+  the brief asks. Todoist labels or projects would be the cheaper first step.
+- **It is a file you own.** The log holds everything you have said to the
+  bot, in plain SQLite. Back it up, or delete it, as you would any personal
+  file. It is git-ignored and never copied into the Docker image.
+
+### Settings
+
+| Variable                | Default    | Meaning                                                                        |
+| ----------------------- | ---------- | ------------------------------------------------------------------------------ |
+| `NEXUS_DB_PATH`         | `nexus.db` | The SQLite file. `/data/nexus.db` in the Docker image; `:memory:` for a dry run |
+| `NEXUS_MEMORY_MESSAGES` | `10`       | Recent messages replayed before each reply; `0` turns that off                 |
+| `NEXUS_MEMORY_HOURS`    | `12`       | How far back those messages may reach                                          |
 
 ## Deploying
 
@@ -522,12 +649,16 @@ polling bot in production.
    `[http_service]` block out of `fly.toml` entirely).
 3. Add the environment variables from your `.env` -- at minimum the three
    tokens, plus `ANTHROPIC_WORKSPACE_ID` if your Claude key needs it.
-4. Confirm the instance count is 1.
-5. Deploy, then read the logs.
+4. Attach a persistent disk or volume at `/data`: the image keeps its memory
+   database at `/data/nexus.db`. Without one the bot still runs, but every
+   deploy starts with an empty memory.
+5. Confirm the instance count is 1.
+6. Deploy, then read the logs.
 
 A healthy start looks exactly like it does locally:
 
 ```
+Memory: /data/nexus.db (0 interactions, 0 topics)
 Todoist OK - 50 open task(s). Model: claude-haiku-4-5
 Claude OK.
 Nexus is polling. Ctrl-C to stop.
@@ -554,11 +685,15 @@ to dodge.
    when variables change.
 3. In **Settings**, confirm **1 replica** and no public domain or port -- Nexus
    serves nothing. Leave the restart policy on its default, restart on failure.
-4. **Stop the bot on your laptop** before this deploy finishes. Two pollers on
+4. Add a **Volume** to the service, mounted at `/data`. That is where the
+   image keeps its memory database, and a volume is what makes it outlive a
+   redeploy. Skip this and the bot still works; it just forgets on every
+   deploy.
+5. **Stop the bot on your laptop** before this deploy finishes. Two pollers on
    one bot token fight over updates.
-5. Open the deployment's **Logs**. A good start is the same three lines as
-   local -- `Todoist OK`, `Claude OK.`, `Nexus is polling.` -- then message the
-   bot.
+6. Open the deployment's **Logs**. A good start is the same lines as local --
+   `Memory: /data/nexus.db`, `Todoist OK`, `Claude OK.`, `Nexus is polling.` --
+   then message the bot.
 
 From here every push to `main` redeploys: CI green, merge, live.
 
@@ -578,25 +713,26 @@ warning at startup while it is unset.
 
 ```bash
 docker build -t nexus .
-docker run --rm --env-file .env nexus
+docker run --rm --env-file .env -v nexus-data:/data nexus
 ```
 
 That is the same image the host runs, so it is worth doing once before you
-deploy. CI builds it on every push too, and boots it with placeholder tokens
-to prove it gets as far as the startup checks -- so a broken `Dockerfile`
-turns the build red before it ever reaches a host.
+deploy. The `-v` keeps the memory database in a named Docker volume between
+runs; leave it off and each run starts with an empty one. CI builds the image
+on every push too, and boots it with placeholder tokens to prove it gets as
+far as the startup checks and can open its database at `/data` -- so a broken
+`Dockerfile` turns the build red before it ever reaches a host.
 
 ## What's deliberately not here (yet)
 
 Each of these would be a small, contained change. They're left out because
 the point of these first stages is understanding the loop, not accreting features.
 
-- **Memory across messages.** LangGraph does this with a *checkpointer*:
-  `graph.compile(checkpointer=MemorySaver())` and pass
-  `config={"configurable": {"thread_id": chat_id}}` to `invoke`. The state
-  then persists per chat, "the second one" would mean something, and a
-  clarifying question could actually be answered. The cost is that context
-  grows every message and you need a policy for trimming it.
+- **Retrieval over memory.** The habit counters are keyed by keyword topics,
+  so "Gym" and "Workout" never meet. Embeddings would cluster them; a vector
+  store would let the agent pull "what did I say about the dentist last
+  month" out of the log. Both are flagged in [Memory](#memory) and left out on
+  purpose: structured fields first, and the log is small enough to read.
 - **Multi-step planning.** The loop already handles "list, then complete the
   one that matches" because Claude chains tool calls itself. A planner node
   that writes down a plan first only pays off once tasks get long enough that

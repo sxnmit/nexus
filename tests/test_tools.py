@@ -1,6 +1,9 @@
 """Tests for the five tools, run against an in-memory Todoist.
 
-Tools are invoked the same way the agent's tool node invokes them: `.invoke({...})`.
+Most tests invoke a tool with plain arguments, `.invoke({...})`, and get its
+text back. The agent's tool node invokes with the whole tool call instead and
+gets a ToolMessage whose artifact is the tool's *event*; the last section
+covers that side channel.
 """
 
 import pytest
@@ -393,3 +396,81 @@ def test_delete_task_propagates_todoist_errors(todoist_api):
 
 def test_delete_task_description_warns_it_is_permanent():
     assert "cannot be undone" in delete_task.description
+
+
+# --- Events: what the tools tell memory, via the artifact -------------------------
+
+
+def call(tool, args):
+    """Invoke the way the agent's tool node does: with the whole tool call, so
+    the result is a ToolMessage carrying the event as its artifact."""
+    return tool.invoke({"name": tool.name, "args": args, "id": "call-1", "type": "tool_call"})
+
+
+def test_create_task_reports_the_created_task(todoist_api):
+    todoist_api()
+
+    result = call(create_task, {"content": "Buy milk", "due_string": "next monday"})
+
+    assert result.content == "Created [900] Buy milk (due 2026-09-14)"
+    assert result.artifact == {
+        "kind": "created",
+        "task": {
+            "id": "900",
+            "content": "Buy milk",
+            "due": {"string": "next monday", "date": "2026-09-14"},
+        },
+    }
+
+
+def test_a_create_with_a_dropped_date_still_reports_the_created_task(todoist_api):
+    todoist_api()
+
+    with pytest.raises(UnexpectedResult) as excinfo:
+        call(create_task, {"content": "Call mum", "due_string": "sometime soonish"})
+
+    assert excinfo.value.event == {"kind": "created", "task": {"id": "900", "content": "Call mum"}}
+
+
+def test_list_tasks_has_no_event(todoist_api):
+    todoist_api(tasks=[])
+    assert call(list_tasks, {}).artifact is None
+
+
+def test_complete_task_reports_the_task_as_it_was(todoist_api):
+    todoist_api(tasks=[{"id": "3", "content": "Buy milk", "due": {"date": "2026-09-09"}}])
+
+    result = call(complete_task, {"task": "milk"})
+
+    assert result.artifact == {
+        "kind": "completed",
+        "task": {"id": "3", "content": "Buy milk", "due": {"date": "2026-09-09"}},
+    }
+
+
+def test_update_task_reports_before_and_after(todoist_api):
+    todoist_api(tasks=[{"id": "3", "content": "Buy milk", "due": {"date": "2026-09-09"}}])
+
+    event = call(update_task, {"task": "3", "due_string": "friday 5pm"}).artifact
+
+    assert event["kind"] == "updated"
+    assert event["before"]["due"] == {"date": "2026-09-09"}
+    assert event["after"]["due"] == {"string": "friday 5pm", "datetime": "2026-09-11T17:00:00"}
+
+
+def test_a_half_applied_update_carries_no_event(todoist_api):
+    todoist_api(tasks=[{"id": "3", "content": "Buy milk"}])
+
+    with pytest.raises(UnexpectedResult) as excinfo:
+        call(update_task, {"task": "3", "due_string": "whenever-ish"})
+
+    assert excinfo.value.event is None
+
+
+def test_delete_task_reports_the_deleted_task(todoist_api):
+    todoist_api(tasks=[{"id": "3", "content": "Buy milk"}])
+
+    assert call(delete_task, {"task": "3"}).artifact == {
+        "kind": "deleted",
+        "task": {"id": "3", "content": "Buy milk"},
+    }

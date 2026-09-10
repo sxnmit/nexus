@@ -17,7 +17,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN useradd --create-home --uid 1000 nexus && chown -R nexus:nexus /app
+# Memory is a SQLite file. /data is where a host mounts a volume; without one
+# the file still works, it just starts empty on every deploy.
+ENV NEXUS_DB_PATH=/data/nexus.db
+RUN useradd --create-home --uid 1000 nexus \
+    && mkdir -p /data \
+    && chown -R nexus:nexus /app /data
 USER nexus
 
 CMD ["python", "bot.py"]

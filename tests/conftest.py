@@ -5,6 +5,7 @@ import pytest
 import agent
 import config
 import todoist
+from memory import Memory
 from tests.support import FakeTodoist, HTTPRecorder
 
 
@@ -35,10 +36,17 @@ def http(monkeypatch):
 
 
 @pytest.fixture
-def ask():
-    """Run one user message through a graph built around a scripted model."""
+def memory():
+    """A fresh in-RAM memory, gone when the test ends."""
+    return Memory(":memory:")
 
-    def run_one(model, text):
-        return agent.run(agent.build_graph(model), text)
+
+@pytest.fixture
+def ask(memory):
+    """Run one user message through a graph built around a scripted model, with
+    the test's memory around it (request the `memory` fixture to inspect it)."""
+
+    def run_one(model, text, chat_id=7):
+        return agent.run(agent.build_graph(model), text, memory, chat_id)
 
     return run_one
