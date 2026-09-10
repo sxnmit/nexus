@@ -515,6 +515,18 @@ the model's "right now it is..." line follow it. Unset, it uses the machine's
 local zone, which is right on a laptop. `bot.py` logs the zone it resolved at
 startup, so a wrong one shows up in the first line.
 
+### Running on a laptop
+
+A laptop sleeps, and the bot's log shows it two ways: `NetworkError:
+httpx.ConnectError: nodename nor servname provided` (DNS is gone) and
+APScheduler's `Run time of job "overdue" ... was missed`. Neither is a crash.
+python-telegram-bot retries polling on its own, and the bot's error handler
+logs such a blip as one warning line rather than a traceback. The jobs carry a
+grace period -- an hour for the check-ins, five minutes for the overdue check
+-- so a morning check-in the machine slept through still sends once it wakes
+within the hour; APScheduler's default grace is one second, which would have
+dropped it. Anything longer is skipped, which is what deploying fixes.
+
 ### Settings
 
 | Variable                      | Default       | Meaning                                                              |

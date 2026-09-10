@@ -500,6 +500,18 @@ def test_schedule_jobs_registers_three_jobs_in_the_configured_zone(monkeypatch):
     assert repeating["interval"] == timedelta(minutes=15) and repeating["name"] == "overdue"
 
 
+def test_schedule_jobs_lets_a_missed_run_still_happen():
+    """A laptop asleep at 08:00 still gets its check-in when it wakes within the hour."""
+    queue = SimpleNamespace(run_daily=Mock(), run_repeating=Mock())
+    proactive, _, _ = make()
+
+    scheduler.schedule_jobs(SimpleNamespace(job_queue=queue), proactive)
+
+    for call in queue.run_daily.call_args_list:
+        assert call.kwargs["job_kwargs"] == {"misfire_grace_time": 3600}
+    assert queue.run_repeating.call_args.kwargs["job_kwargs"] == {"misfire_grace_time": 300}
+
+
 def test_scheduled_callbacks_run_the_jobs():
     queue = SimpleNamespace(run_daily=Mock(), run_repeating=Mock())
     proactive, _, _ = make()

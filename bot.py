@@ -9,6 +9,7 @@ import sqlite3
 
 from telegram import Update
 from telegram.constants import ChatAction
+from telegram.error import NetworkError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -89,6 +90,16 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(reply)
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """python-telegram-bot retries network trouble by itself -- a laptop going
+    to sleep, Wi-Fi dropping -- so one line is enough for the log. Anything
+    else is a bug and gets its traceback."""
+    if isinstance(context.error, NetworkError):
+        log.warning("Telegram unreachable (%s); retrying", context.error)
+    else:
+        log.error("Unhandled error in the bot", exc_info=context.error)
+
+
 def _sender(app):
     """How proactive messages leave: the same bot, addressed by chat id."""
 
@@ -163,6 +174,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("memory", on_memory))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_error_handler(on_error)
 
     log.info("Timezone: %s", config.TIMEZONE)
     proactive = Proactive(

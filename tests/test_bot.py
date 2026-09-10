@@ -153,6 +153,37 @@ def test_on_start_is_silent_for_unauthorised_users(locked_bot):
     update.message.reply_text.assert_not_awaited()
 
 
+# --- Errors -------------------------------------------------------------------
+
+
+def test_on_error_logs_network_trouble_as_one_warning_line(caplog):
+    from telegram.error import NetworkError
+
+    context = SimpleNamespace(error=NetworkError("httpx.ConnectError: nodename nor servname"))
+
+    with caplog.at_level(logging.WARNING, logger="nexus"):
+        asyncio.run(bot.on_error(None, context))
+
+    assert caplog.record_tuples == [
+        (
+            "nexus",
+            logging.WARNING,
+            "Telegram unreachable (httpx.ConnectError: nodename nor servname); retrying",
+        )
+    ]
+
+
+def test_on_error_keeps_the_traceback_for_anything_else(caplog):
+    context = SimpleNamespace(error=RuntimeError("boom"))
+
+    with caplog.at_level(logging.ERROR, logger="nexus"):
+        asyncio.run(bot.on_error(None, context))
+
+    record = caplog.records[0]
+    assert record.levelno == logging.ERROR
+    assert record.exc_info[1] is context.error, "a bug keeps its traceback"
+
+
 # --- /memory ------------------------------------------------------------------
 
 
@@ -223,7 +254,13 @@ def boot(monkeypatch, todoist_api, chat_id):
     monkeypatch.setattr(config, "TELEGRAM_CHAT_ID", chat_id)
     todoist_api(tasks=[])
     queue = SimpleNamespace(run_daily=Mock(), run_repeating=Mock())
-    app = SimpleNamespace(bot_data={}, add_handler=Mock(), run_polling=Mock(), job_queue=queue)
+    app = SimpleNamespace(
+        bot_data={},
+        add_handler=Mock(),
+        add_error_handler=Mock(),
+        run_polling=Mock(),
+        job_queue=queue,
+    )
     builder = SimpleNamespace(token=lambda token: SimpleNamespace(build=lambda: app))
     monkeypatch.setattr(bot.Application, "builder", lambda: builder)
     monkeypatch.setattr(bot, "build_graph", lambda: "the-graph")
@@ -241,6 +278,7 @@ def test_main_wires_the_handlers_and_starts_polling(monkeypatch, todoist_api, ca
     assert isinstance(app.bot_data["memory"], bot.Memory)
     handler_types = [type(call.args[0]).__name__ for call in app.add_handler.call_args_list]
     assert handler_types == ["CommandHandler", "CommandHandler", "MessageHandler"]
+    app.add_error_handler.assert_called_once_with(bot.on_error)
     app.run_polling.assert_called_once()
     assert app.job_queue.run_daily.call_count == 0, "no recipient, so no check-ins"
     assert "Proactive messages OFF" in caplog.text

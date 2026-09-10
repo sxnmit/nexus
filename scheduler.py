@@ -48,6 +48,13 @@ NUDGE_LOOKBACK = timedelta(hours=24)
 # Telegram rejects messages over 4096 characters.
 MAX_MESSAGE = 4000
 
+# How late a job may still run. APScheduler's default is one second: a laptop
+# that was asleep at 08:00 would skip the whole check-in, and a six-second
+# stall would skip an overdue check. A check-in within the hour is still that
+# morning's; an overdue check is repeated anyway, so a few minutes is enough.
+DAILY_GRACE = timedelta(hours=1)
+NUDGE_GRACE = timedelta(minutes=5)
+
 Sender = Callable[[int, str], Awaitable[None]]
 
 
@@ -329,7 +336,9 @@ def schedule_jobs(app, proactive: Proactive) -> None:
     """Register the three jobs on the bot's JobQueue (APScheduler underneath).
 
     The times carry NEXUS_TIMEZONE. A naive time would mean UTC to the
-    JobQueue, which on a host is how "8am" quietly becomes 4am.
+    JobQueue, which on a host is how "8am" quietly becomes 4am. The grace
+    periods let a job that was missed -- the machine was asleep, the loop was
+    busy -- still run once, late, instead of being dropped.
     """
     tz = config.TIMEZONE
 
@@ -343,11 +352,17 @@ def schedule_jobs(app, proactive: Proactive) -> None:
         await proactive.overdue_nudge()
 
     queue = app.job_queue
-    queue.run_daily(morning, time=config.MORNING_TIME.replace(tzinfo=tz), name="morning")
-    queue.run_daily(evening, time=config.EVENING_TIME.replace(tzinfo=tz), name="evening")
+    daily = {"misfire_grace_time": int(DAILY_GRACE.total_seconds())}
+    queue.run_daily(
+        morning, time=config.MORNING_TIME.replace(tzinfo=tz), name="morning", job_kwargs=daily
+    )
+    queue.run_daily(
+        evening, time=config.EVENING_TIME.replace(tzinfo=tz), name="evening", job_kwargs=daily
+    )
     queue.run_repeating(
         nudge,
         interval=timedelta(minutes=config.OVERDUE_CHECK_MINUTES),
         first=timedelta(minutes=1),
         name="overdue",
+        job_kwargs={"misfire_grace_time": int(NUDGE_GRACE.total_seconds())},
     )
