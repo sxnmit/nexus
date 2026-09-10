@@ -1,4 +1,4 @@
-"""Tests for the five tools, run against an in-memory Todoist.
+"""Tests for the six tools, run against an in-memory Todoist.
 
 Most tests invoke a tool with plain arguments, `.invoke({...})`, and get its
 text back. The agent's tool node invokes with the whole tool call instead and
@@ -14,10 +14,13 @@ from tools import (
     NeedsClarification,
     UnexpectedResult,
     _format_task,
+    _offset_text,
+    _parse_offset,
     complete_task,
     create_task,
     delete_task,
     list_tasks,
+    set_reminder,
     update_task,
 )
 
@@ -40,6 +43,7 @@ def test_tool_names_and_required_arguments_match_what_the_prompt_promises():
         "complete_task",
         "update_task",
         "delete_task",
+        "set_reminder",
     ]
     assert schemas["create_task"]["required"] == ["content"]
     assert set(schemas["create_task"]["properties"]) == {"content", "due_string"}
@@ -53,6 +57,8 @@ def test_tool_names_and_required_arguments_match_what_the_prompt_promises():
         "priority",
     }
     assert schemas["delete_task"]["required"] == ["task"]
+    assert schemas["set_reminder"]["required"] == ["task"]
+    assert set(schemas["set_reminder"]["properties"]) == {"task", "before", "at"}
 
 
 def test_every_tool_and_argument_carries_a_description():
@@ -474,3 +480,172 @@ def test_delete_task_reports_the_deleted_task(todoist_api):
         "kind": "deleted",
         "task": {"id": "3", "content": "Buy milk"},
     }
+
+
+# --- set_reminder -----------------------------------------------------------------
+
+TIMED = {"id": "3", "content": "Submit PR", "due": {"date": "2026-09-21T23:59:00"}}
+DAY_ONLY = {"id": "4", "content": "Taxes", "due": {"date": "2026-09-21"}}
+
+
+@pytest.mark.parametrize(
+    ("text", "minutes"),
+    [
+        ("30 minutes", 30),
+        ("30 min", 30),
+        ("30m", 30),
+        ("2 hours", 120),
+        ("an hour", 60),
+        ("a day", 1440),
+        ("1 day before", 1440),
+        ("1 week", 10080),
+        ("1h30m", 90),
+        ("1 hour 30 minutes", 90),
+        ("2.5 hours", 150),
+    ],
+)
+def test_parse_offset_reads_plain_durations(text, minutes):
+    assert _parse_offset(text) == minutes
+
+
+@pytest.mark.parametrize("text", ["soon", "", "0 minutes", "a while"])
+def test_parse_offset_asks_when_it_cannot_read_the_duration(text):
+    with pytest.raises(NeedsClarification, match="how long before"):
+        _parse_offset(text)
+
+
+@pytest.mark.parametrize(
+    ("minutes", "text"),
+    [
+        (30, "30 min"),
+        (60, "1 hour"),
+        (120, "2 hours"),
+        (90, "90 min"),
+        (1440, "1 day"),
+        (4320, "3 days"),
+        (10080, "1 week"),
+    ],
+)
+def test_offset_text(minutes, text):
+    assert _offset_text(minutes) == text
+
+
+def test_set_reminder_needs_exactly_one_of_before_and_at(todoist_api):
+    todoist_api(tasks=[TIMED])
+    for args in ({"task": "3"}, {"task": "3", "before": "30 minutes", "at": "9am"}):
+        with pytest.raises(NeedsClarification, match="exactly one"):
+            set_reminder.invoke(args)
+
+
+def test_set_reminder_before_the_due_time(todoist_api):
+    todo = todoist_api(tasks=[TIMED])
+
+    out = set_reminder.invoke({"task": "submit pr", "before": "30 minutes"})
+
+    assert out == (
+        "Reminder set on [3] Submit PR (due 2026-09-21T23:59:00): 30 min before "
+        "(fires 2026-09-21T23:29:00)."
+    )
+    assert todo.commands[0]["type"] == "reminder_add"
+    assert todo.commands[0]["args"] == {"item_id": "3", "type": "relative", "minute_offset": 30}
+
+
+def test_set_reminder_at_a_time_in_the_users_words(todoist_api):
+    todo = todoist_api(tasks=[TIMED])
+
+    out = set_reminder.invoke({"task": "3", "at": "tomorrow at 3pm"})
+
+    assert out == "Reminder set on [3] Submit PR (due 2026-09-21T23:59:00): at 2026-09-09T15:00:00."
+    assert todo.commands[0]["args"] == {
+        "item_id": "3",
+        "type": "absolute",
+        "due": {"string": "tomorrow at 3pm"},
+    }
+
+
+def test_set_reminder_before_needs_a_task_with_a_due_time(todoist_api):
+    todo = todoist_api(tasks=[DAY_ONLY])
+
+    with pytest.raises(NeedsClarification, match="no due time"):
+        set_reminder.invoke({"task": "taxes", "before": "1 hour"})
+
+    assert todo.commands == []
+
+
+def test_set_reminder_at_works_on_a_task_without_a_time(todoist_api):
+    todoist_api(tasks=[DAY_ONLY])
+
+    out = set_reminder.invoke({"task": "taxes", "at": "next monday"})
+
+    assert out == "Reminder set on [4] Taxes (due 2026-09-21): at 2026-09-14."
+
+
+def test_set_reminder_does_not_duplicate_an_existing_one(todoist_api):
+    todo = todoist_api(tasks=[TIMED])
+    set_reminder.invoke({"task": "3", "before": "30 minutes"})
+    set_reminder.invoke({"task": "3", "before": "1 day"})
+
+    out = set_reminder.invoke({"task": "3", "before": "30 min"})
+
+    assert out == (
+        "[3] Submit PR (due 2026-09-21T23:59:00) already has a reminder 30 min before "
+        "(fires 2026-09-21T23:29:00). Nothing added. Other reminders on it: 1 day before "
+        "(fires 2026-09-20T23:59:00)."
+    )
+    assert len(todo.commands) == 2, "no third reminder_add"
+
+
+def test_set_reminder_mentions_the_reminders_already_there(todoist_api):
+    todoist_api(tasks=[TIMED])
+    set_reminder.invoke({"task": "3", "before": "1 day"})
+
+    out = set_reminder.invoke({"task": "3", "before": "30 minutes"})
+
+    assert out.endswith("Other reminders on it: 1 day before (fires 2026-09-20T23:59:00).")
+
+
+def test_set_reminder_undoes_a_reminder_todoist_could_not_place_in_time(todoist_api):
+    todo = todoist_api(tasks=[TIMED])
+
+    with pytest.raises(UnexpectedResult) as excinfo:
+        set_reminder.invoke({"task": "3", "at": "sometime soonish"})
+
+    assert "did not understand the reminder time 'sometime soonish'" in str(excinfo.value)
+    assert "simpler phrase" in excinfo.value.repair
+    assert [c["type"] for c in todo.commands] == ["reminder_add", "reminder_delete"]
+    assert todo.reminders[0]["is_deleted"] is True, "no dud left on the task"
+
+
+def test_set_reminder_reports_a_reminder_that_did_not_land(todoist_api, monkeypatch):
+    todoist_api(tasks=[TIMED])
+    monkeypatch.setattr(todoist, "add_reminder", lambda *a, **k: None)
+
+    with pytest.raises(UnexpectedResult) as excinfo:
+        set_reminder.invoke({"task": "3", "before": "1 hour"})
+
+    assert "not on the task" in str(excinfo.value)
+    assert "Do not call set_reminder again" in excinfo.value.repair
+
+
+def test_set_reminder_is_ambiguous_like_the_other_tools(todoist_api):
+    todoist_api(tasks=TASKS)
+
+    with pytest.raises(NeedsClarification, match="matches 2 open tasks"):
+        set_reminder.invoke({"task": "review", "before": "1 hour"})
+
+
+def test_set_reminder_propagates_a_rejected_command(todoist_api):
+    todoist_api(
+        tasks=[TIMED],
+        reminder_error={"error": "Premium required", "error_code": 1, "http_code": 403},
+    )
+
+    with pytest.raises(todoist.TodoistError, match="Premium required") as excinfo:
+        set_reminder.invoke({"task": "3", "before": "1 hour"})
+
+    assert excinfo.value.status_code == 403
+
+
+def test_set_reminder_has_no_event_for_memory(todoist_api):
+    todoist_api(tasks=[TIMED])
+    assert call(set_reminder, {"task": "3", "before": "1 hour"}).artifact is None

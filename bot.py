@@ -34,6 +34,7 @@ GREETING = (
     "  what's on my list?\n"
     "  mark the PR review done\n"
     "  move the PR review to friday 5pm\n"
+    "  remind me 30 minutes before the PR review\n"
     "  delete the milk task\n\n"
     f"I'll also check in at {config.MORNING_TIME:%H:%M} with what's due and at "
     f"{config.EVENING_TIME:%H:%M} with what got done. "

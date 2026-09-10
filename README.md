@@ -1,8 +1,9 @@
 # Nexus
 
 A personal task assistant you message on Telegram. It runs a small LangGraph
-agent on Claude that manages your Todoist through five tools -- create, list,
-complete, update and delete tasks -- and replies in plain language.
+agent on Claude that manages your Todoist through six tools -- create, list,
+complete, update and delete tasks, and set reminders on them -- and replies in
+plain language.
 
 ```
 You:    remind me to submit the iTrade PR review tomorrow at 3pm
@@ -122,7 +123,7 @@ Send the conversation so far to Claude and append whatever it says: an
 **`tool_calls`** (it wants to do something first). This node never touches
 Todoist. It only decides.
 
-The Stage 2 addition is *which* Claude it sends to. `acting` has the five
+The Stage 2 addition is *which* Claude it sends to. `acting` has the six
 tools bound. `responding` is the same model with **no tools at all**, used when
 `observe` has decided the right move is to talk to the user. That turns "ask a
 clarifying question instead of guessing" from a prompt instruction into a
@@ -319,8 +320,8 @@ package.
 | ------------------- | ------------------------------------------------------------------- |
 | `bot.py`            | Telegram polling loop. Hands each message to the agent, replies.    |
 | `agent.py`          | The graph: state, the three nodes, the `classify` table, `run()`.   |
-| `tools.py`          | The five Todoist tools, raising typed failures that `observe` reads.|
-| `todoist.py`        | Thin HTTP client for the three Todoist calls. Raises `TodoistError`.|
+| `tools.py`          | The six Todoist tools, raising typed failures that `observe` reads. |
+| `todoist.py`        | Thin HTTP client for the task endpoints and the Sync call reminders need. |
 | `config.py`         | Reads `.env`. Nothing raises on import; `bot.py` validates at start.|
 | `scheduler.py`      | Stage 3: the quiet-hours gate and the three time-triggered jobs.   |
 | `memory.py`         | Stage 4: the SQLite interaction log, the habit counters, and the scheduler's shelf. |
@@ -362,6 +363,36 @@ is verified against recorded responses rather than the live API. The startup
 check in `bot.py` is your first real call -- if it fails, the error message
 tells you what to look at.
 
+### Reminders
+
+"Remind me to submit the PR tomorrow at 3pm" is a *task* with a due time; that
+has worked since Week 1, and Todoist's own automatic reminders (Settings ->
+Reminders) apply to it. `set_reminder` is for the extra notification on a task
+that already exists: "remind me 30 minutes before the PR review" (relative to
+the due time) or "ping me about it at 9am" (an exact time in your words). The
+prompt spells out that distinction, so "remind me to..." keeps creating tasks.
+
+Three things worth knowing:
+
+- Reminders are a Todoist Pro feature, and they are not on the task endpoints
+  the other tools use. They live behind the older Sync protocol: one POST that
+  applies a batch of commands (`reminder_add`, `reminder_delete`) and can read
+  a resource type back. `todoist.sync()` wraps exactly that, and turns a failed
+  command's error and HTTP code into the usual `TodoistError`, so the observe
+  step judges it like any other failure.
+- Verify, don't trust, again. After `reminder_add`, the tool reads the task's
+  reminders back and reports the one it added *as Todoist holds it*, including
+  the moment it fires. A time Todoist could not parse would leave a reminder
+  with no time; the tool deletes that dud and raises the half-success with a
+  repair, the same shape as a dropped due date on `create_task`.
+- Todoist sends the notification, not Nexus. Nexus's own nudge still fires when
+  a timed task goes overdue; a reminder is the "before" that Todoist delivers
+  to your phone.
+
+A relative reminder needs a task with a due *time*; on a day-only task the
+tool asks for one rather than guessing. Duplicates are skipped and reported
+("already has a reminder 30 min before").
+
 ### Lock it down
 
 A Telegram bot is public: anyone who finds its username can message it, and
@@ -372,7 +403,7 @@ else. It warns at startup if this isn't set.
 ### Model
 
 `claude-haiku-4-5` by default (`NEXUS_MODEL` to override). Deciding which of
-five tools to call is a routing job, not a reasoning one, and Haiku is fast
+six tools to call is a routing job, not a reasoning one, and Haiku is fast
 and cheap at it.
 
 `max_tokens` is 1024 (`NEXUS_MAX_TOKENS` to override). That is a ceiling on
@@ -443,7 +474,7 @@ Proactive messages are written by templates, not by Claude. They are
 *reports*; the agent loop is for *requests*. A template is deterministic,
 tested to the character, costs nothing at three sends a day, and cannot
 hallucinate a task. Your *reply* to a check-in goes through the normal agent
-with all five tools, so "push the PR review to tomorrow" works exactly as it
+with all six tools, so "push the PR review to tomorrow" works exactly as it
 does any other time -- and, since Stage 4, with the check-in in its
 conversation memory, so "push it to tomorrow" works too. Memory adds one
 sentence per task the counters flag ("'Gym' keeps slipping (moved 4 times
@@ -539,7 +570,7 @@ still does.
 
 ### Habits: counters, not a model
 
-The five tools attach an *event* to every successful call -- the task as
+The task tools attach an *event* to every successful call -- the task as
 Todoist returned it, or before-and-after for an update -- in the ToolMessage's
 artifact, the same model-invisible side channel the observe step uses.
 `run()` hands each event to `Memory.learn()`, which updates one row:

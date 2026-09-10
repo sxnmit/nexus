@@ -1,4 +1,4 @@
-"""The five tools the agent can call.
+"""The six tools the agent can call.
 
 Each returns two things: a short string that goes straight back into the
 conversation as an observation (so the wording is aimed at the model, not at a
@@ -22,12 +22,22 @@ Three rules make the observe step in agent.py work:
     not parse; a 200 is not the same as "done".
 """
 
+import re
+
 from langchain_core.tools import tool
 
 import todoist
 
 # Phrases that mean "clear the due date" rather than set one.
 _REMOVE_DUE = {"no date", "no due date", "none", "remove"}
+
+# How long before: "30 minutes", "2 hours", "a day", "1 week", "1h30m".
+# The unit must not run on into more letters ("a moment" is not "a m"), but a
+# digit may follow it ("1h30m").
+_OFFSET = re.compile(
+    r"(\d+(?:\.\d+)?|an?)\s*(minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|wks?|w)(?![a-z])"
+)
+_UNIT_MINUTES = {"m": 1, "h": 60, "d": 1440, "w": 10080}
 
 
 class NeedsClarification(Exception):
@@ -246,4 +256,108 @@ def delete_task(task: str) -> tuple[str, dict]:
     return f"Deleted {_format_task(found)}", {"kind": "deleted", "task": found}
 
 
-TOOLS = [create_task, list_tasks, complete_task, update_task, delete_task]
+def _parse_offset(text: str) -> int:
+    """'30 minutes' -> 30, '2 hours' -> 120, 'a day' -> 1440, '1h30m' -> 90."""
+    total = 0.0
+    for amount, unit in _OFFSET.findall(text.lower()):
+        count = 1.0 if amount in ("a", "an") else float(amount)
+        total += count * _UNIT_MINUTES[unit[0]]
+    minutes = round(total)
+    if minutes <= 0:
+        raise NeedsClarification(
+            f"Could not read '{text}' as a length of time. Ask the user how long before the "
+            f"task's due time they want the reminder, e.g. '30 minutes' or '1 day'."
+        )
+    return minutes
+
+
+def _offset_text(minutes: int) -> str:
+    for unit, size in (("week", 10080), ("day", 1440), ("hour", 60)):
+        if minutes % size == 0:
+            count = minutes // size
+            return f"{count} {unit}{'s' if count != 1 else ''}"
+    return f"{minutes} min"
+
+
+def _describe_reminder(reminder: dict) -> str:
+    """'30 min before (fires 2026-09-21T23:29:00)' or 'at 2026-09-12T09:00:00'."""
+    when = (reminder.get("due") or {}).get("date")
+    if reminder.get("type") == "relative":
+        return f"{_offset_text(reminder.get('minute_offset') or 0)} before (fires {when})"
+    return f"at {when}"
+
+
+def _also(reminders: list[dict]) -> str:
+    if not reminders:
+        return ""
+    return " Other reminders on it: " + "; ".join(_describe_reminder(r) for r in reminders) + "."
+
+
+@tool(parse_docstring=True, response_format="content_and_artifact")
+def set_reminder(task: str, before: str = "", at: str = "") -> tuple[str, None]:
+    """Add a reminder to an existing task, so Todoist notifies the user before
+    it is due or at a chosen time. Give exactly one of `before` or `at`. (This
+    is a Todoist Pro feature.)
+
+    Args:
+        task: The task's id (as shown by list_tasks) or part of its name.
+        before: How long before the task's due time to remind, in plain words:
+            "30 minutes", "2 hours", "1 day", "1 week". The task must have a
+            due time. Leave empty when using `at`.
+        at: An exact moment for the reminder in the user's own words, e.g.
+            "tomorrow at 9am" or "friday 5pm"; Todoist parses it, so do not
+            convert it. Leave empty when using `before`.
+    """
+    before, at = before.strip(), at.strip()
+    if bool(before) == bool(at):
+        raise NeedsClarification(
+            "A reminder needs exactly one of: how long before the due time (before), or an "
+            "exact time (at). Ask the user which they want."
+        )
+
+    found = _find_task(task, "set a reminder on")
+    existing = todoist.get_reminders(found["id"])
+
+    if before:
+        minutes = _parse_offset(before)
+        if todoist.parse_due(found)[1] is None:
+            raise NeedsClarification(
+                f"{_format_task(found)} has no due time, so '{before} before' has nothing to "
+                f"count from. Ask the user for a time for the task, or for an exact reminder "
+                f"time instead."
+            )
+        for reminder in existing:
+            if reminder.get("type") == "relative" and reminder.get("minute_offset") == minutes:
+                others = [r for r in existing if r is not reminder]
+                return (
+                    f"{_format_task(found)} already has a reminder "
+                    f"{_describe_reminder(reminder)}. Nothing added.{_also(others)}"
+                ), None
+        reminder = todoist.add_reminder(found["id"], minute_offset=minutes)
+    else:
+        reminder = todoist.add_reminder(found["id"], due_string=at)
+
+    if reminder is None:
+        raise UnexpectedResult(
+            f"Todoist said a reminder was added to {_format_task(found)}, but it is not on "
+            f"the task.",
+            repair="Do not call set_reminder again. Tell the user to check the task in the "
+            "Todoist app.",
+        )
+    if at and not (reminder.get("due") or {}).get("date"):
+        # Todoist kept a reminder it could not place in time. Undo it rather
+        # than leave a dud on the task, then report honestly.
+        todoist.delete_reminder(reminder["id"])
+        raise UnexpectedResult(
+            f"Todoist did not understand the reminder time '{at}' for {_format_task(found)}, "
+            f"so nothing was kept.",
+            repair="Call set_reminder again with a simpler phrase for at, such as 'tomorrow "
+            "9am', or ask the user.",
+        )
+
+    return (
+        f"Reminder set on {_format_task(found)}: {_describe_reminder(reminder)}.{_also(existing)}"
+    ), None
+
+
+TOOLS = [create_task, list_tasks, complete_task, update_task, delete_task, set_reminder]

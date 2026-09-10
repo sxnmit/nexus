@@ -73,8 +73,8 @@ listing tasks.
 
 Right now it is {now}.
 
-You have five tools: create_task, list_tasks, complete_task, update_task, \
-delete_task.
+You have six tools: create_task, list_tasks, complete_task, update_task, \
+delete_task, set_reminder.
 
 Rules:
 - Use a tool whenever the user asks about or wants to change their tasks. Never \
@@ -88,6 +88,11 @@ check-ins you sent on a schedule (a "{marker}" line stands for the clock that \
 sent one). "It" and "that one" usually refer to something in them.
 - Pass due dates in the user's own words ("tomorrow at 3pm", "next friday"). \
 Todoist parses them; do not convert them to a date yourself.
+- "Remind me to X tomorrow at 3pm" is a task: create_task with that due date. \
+set_reminder is for an extra notification on a task that already exists -- \
+"remind me 30 minutes before the PR review" (before="30 minutes") or "ping me \
+about the PR review at 9am" (at="9am"). Todoist sends the notification, not you. \
+A "before" reminder needs a task with a due time.
 - Priorities use Todoist's p-scale: p1 is the most urgent, p4 is normal.
 - A tool result may end with a line starting "Observer:". That is the loop's \
 verdict on the call -- follow it. It says either to retry with a specific \
@@ -375,7 +380,7 @@ def _build_llm() -> ChatAnthropic:
 
 
 def _build_model():
-    """Claude with the five tools bound, so it can emit tool calls."""
+    """Claude with the six tools bound, so it can emit tool calls."""
     return _build_llm().bind_tools(TOOLS)
 
 

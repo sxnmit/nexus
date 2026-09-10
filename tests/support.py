@@ -6,6 +6,7 @@ that hands back real httpx.Response objects (for the client itself).
 """
 
 import json
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import httpx
@@ -85,6 +86,7 @@ class FakeTodoist:
         fail_times=None,
         pages=None,
         bare_list=False,
+        reminder_error=None,
     ):
         self.tasks = [dict(task) for task in (tasks or [])]
         self.fail = fail
@@ -98,6 +100,9 @@ class FakeTodoist:
         self.deleted = []
         self.closed = []
         self.calls = []
+        self.reminders = []  # what the Sync endpoint holds
+        self.commands = []  # every Sync command received
+        self.reminder_error = reminder_error  # a sync_status error to answer reminder_add with
 
     def _find(self, task_id):
         for task in self.tasks:
@@ -165,7 +170,66 @@ class FakeTodoist:
             self.deleted.append(parts[1])
             return None
 
+        if method == "POST" and path == "/sync":
+            return self._sync(kwargs.get("data") or {})
+
         raise AssertionError(f"unexpected Todoist call: {method} {path}")
+
+    def _sync(self, form):
+        """Apply the commands, then read back the resources asked for -- the
+        same round trip the real endpoint does."""
+        response = {"sync_status": {}, "temp_id_mapping": {}}
+        for command in json.loads(form.get("commands", "[]")):
+            self.commands.append(command)
+            status = self._apply(command)
+            response["sync_status"][command["uuid"]] = status
+            if status == "ok" and command["type"] == "reminder_add":
+                response["temp_id_mapping"][command["temp_id"]] = self.reminders[-1]["id"]
+        if "reminders" in json.loads(form.get("resource_types", "[]")):
+            response["reminders"] = [dict(r) for r in self.reminders]
+        return response
+
+    def _apply(self, command):
+        args = command["args"]
+        if command["type"] == "reminder_add":
+            if self.reminder_error:
+                return self.reminder_error
+            task = next((t for t in self.tasks if str(t["id"]) == str(args["item_id"])), None)
+            if task is None:
+                return {"error": "Item not found", "error_code": 27, "http_code": 400}
+            reminder = {
+                "id": f"rem-{len(self.reminders) + 1}",
+                "item_id": args["item_id"],
+                "type": args["type"],
+                "is_deleted": False,
+                "notify_uid": "u1",
+                "due": None,
+            }
+            if args["type"] == "relative":
+                reminder["minute_offset"] = args["minute_offset"]
+                when = _moment(task)
+                if when is not None:
+                    fires = when - timedelta(minutes=args["minute_offset"])
+                    reminder["due"] = {"date": fires.strftime("%Y-%m-%dT%H:%M:%S")}
+            else:
+                due = PARSEABLE_DUE.get(args["due"]["string"])
+                if due:  # an unparseable time leaves a reminder with no due, like a task
+                    reminder["due"] = {"date": due.get("datetime") or due.get("date")}
+            self.reminders.append(reminder)
+            return "ok"
+        if command["type"] == "reminder_delete":
+            for reminder in self.reminders:
+                if reminder["id"] == args["id"]:
+                    reminder["is_deleted"] = True
+            return "ok"
+        return {"error": f"Unknown command {command['type']}", "http_code": 400}
+
+
+def _moment(task):
+    """A task's due time as a naive datetime, or None for day-only / undated."""
+    due = task.get("due") or {}
+    raw = due.get("datetime") or (due.get("date") if "T" in (due.get("date") or "") else None)
+    return datetime.fromisoformat(raw) if raw else None
 
 
 class HTTPRecorder:
@@ -188,6 +252,7 @@ class HTTPRecorder:
                 headers=kwargs.get("headers") or {},
                 params=kwargs.get("params"),
                 json=kwargs.get("json"),
+                data=kwargs.get("data"),
                 timeout=kwargs.get("timeout"),
             )
         )

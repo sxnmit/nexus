@@ -5,6 +5,8 @@ URL building, auth headers, status handling and pagination rather than mocks of
 our own code.
 """
 
+import json
+
 import httpx
 import pytest
 
@@ -189,3 +191,121 @@ def test_timeouts_become_todoist_errors(http):
 
     with pytest.raises(todoist.TodoistError, match="Could not reach Todoist"):
         todoist.create_task("Buy milk")
+
+
+# --- Reminders: the Sync endpoint -----------------------------------------------
+
+
+COMMAND = {"type": "reminder_add", "temp_id": "t1", "uuid": "u1", "args": {"item_id": "5"}}
+
+
+@pytest.fixture
+def fixed_ids(monkeypatch):
+    """_command() draws a temp_id, then a uuid; make both predictable."""
+    ids = iter(["temp-1", "cmd-1", "temp-2", "cmd-2"])
+    monkeypatch.setattr(todoist.uuid, "uuid4", lambda: next(ids))
+
+
+def test_sync_sends_commands_as_a_form_and_returns_the_result(http):
+    http.queue(200, {"sync_status": {"u1": "ok"}, "temp_id_mapping": {"t1": "r9"}})
+
+    out = todoist.sync(commands=[COMMAND])
+
+    call = http.calls[0]
+    assert (call.method, call.url) == ("POST", f"{config.TODOIST_API_BASE}/sync")
+    assert json.loads(call.data["commands"]) == [COMMAND]
+    assert "sync_token" not in call.data, "a command batch is not a read"
+    assert out["temp_id_mapping"] == {"t1": "r9"}
+
+
+def test_sync_reads_resources_with_a_full_sync_token(http):
+    http.queue(200, {"reminders": [], "sync_status": {}})
+
+    todoist.sync(resource_types=["reminders"])
+
+    assert http.calls[0].data == {"sync_token": "*", "resource_types": '["reminders"]'}
+
+
+def test_sync_raises_when_a_command_fails(http):
+    http.queue(
+        200,
+        {
+            "sync_status": {
+                "u1": {"error": "Invalid temporary id", "error_code": 16, "http_code": 400}
+            }
+        },
+    )
+
+    with pytest.raises(todoist.TodoistError, match="Invalid temporary id") as excinfo:
+        todoist.sync(commands=[COMMAND])
+
+    assert excinfo.value.status_code == 400, "the observe step judges from this"
+
+
+def test_sync_raises_when_a_command_gets_no_status(http):
+    http.queue(200, {"sync_status": {}})
+
+    with pytest.raises(todoist.TodoistError, match="no status"):
+        todoist.sync(commands=[COMMAND])
+
+
+def test_get_reminders_filters_by_task_and_drops_deleted_ones(http):
+    http.queue(
+        200,
+        {
+            "reminders": [
+                {"id": "a", "item_id": "5"},
+                {"id": "b", "item_id": "6"},
+                {"id": "c", "item_id": "5", "is_deleted": True},
+            ]
+        },
+    )
+
+    assert [r["id"] for r in todoist.get_reminders("5")] == ["a"]
+
+
+def test_add_reminder_relative_sends_uuids_and_reads_the_reminder_back(http, fixed_ids):
+    http.queue(200, {"sync_status": {"cmd-1": "ok"}, "temp_id_mapping": {"temp-1": "r9"}})
+    http.queue(
+        200, {"reminders": [{"id": "r9", "item_id": "5", "type": "relative", "minute_offset": 30}]}
+    )
+
+    out = todoist.add_reminder("5", minute_offset=30)
+
+    assert json.loads(http.calls[0].data["commands"]) == [
+        {
+            "type": "reminder_add",
+            "temp_id": "temp-1",
+            "uuid": "cmd-1",
+            "args": {"item_id": "5", "type": "relative", "minute_offset": 30},
+        }
+    ]
+    assert http.calls[1].data["resource_types"] == '["reminders"]', "verify, don't trust"
+    assert out["id"] == "r9"
+
+
+def test_add_reminder_absolute_passes_the_users_words(http, fixed_ids):
+    http.queue(200, {"sync_status": {"cmd-1": "ok"}, "temp_id_mapping": {"temp-1": "r9"}})
+    http.queue(200, {"reminders": [{"id": "r9", "item_id": "5", "type": "absolute"}]})
+
+    todoist.add_reminder("5", due_string="tomorrow 9am")
+
+    args = json.loads(http.calls[0].data["commands"])[0]["args"]
+    assert args == {"item_id": "5", "type": "absolute", "due": {"string": "tomorrow 9am"}}
+
+
+def test_add_reminder_returns_none_when_the_reminder_is_not_on_the_task(http, fixed_ids):
+    http.queue(200, {"sync_status": {"cmd-1": "ok"}, "temp_id_mapping": {"temp-1": "r9"}})
+    http.queue(200, {"reminders": []})
+
+    assert todoist.add_reminder("5", minute_offset=30) is None
+
+
+def test_delete_reminder_sends_the_command(http, fixed_ids):
+    http.queue(200, {"sync_status": {"cmd-1": "ok"}})
+
+    assert todoist.delete_reminder("r9") is None
+
+    assert json.loads(http.calls[0].data["commands"]) == [
+        {"type": "reminder_delete", "temp_id": "temp-1", "uuid": "cmd-1", "args": {"id": "r9"}}
+    ]

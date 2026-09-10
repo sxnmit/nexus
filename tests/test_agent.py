@@ -58,7 +58,7 @@ def test_check_model_makes_exactly_one_tiny_request(monkeypatch):
     assert len(calls) == 1 and len(calls[0]) == 1
 
 
-def test_build_graph_binds_the_real_model_to_the_five_tools_by_default():
+def test_build_graph_binds_the_real_model_to_the_six_tools_by_default():
     model = agent._build_model()
 
     assert model.bound.model == config.MODEL
@@ -68,6 +68,7 @@ def test_build_graph_binds_the_real_model_to_the_five_tools_by_default():
         "complete_task",
         "update_task",
         "delete_task",
+        "set_reminder",
     ]
     assert agent.build_graph() is not None
 
@@ -130,6 +131,13 @@ def test_system_prompt_spells_out_the_error_handling_contract():
     assert "never tell the user something worked when the tool said it did not" in prompt
     assert "clarifying question" in prompt
     assert "observer:" in prompt, "the model must be told what the verdict line is"
+
+
+def test_system_prompt_tells_the_model_when_a_reminder_is_really_a_task():
+    prompt = agent._system_prompt()
+    assert "set_reminder" in prompt
+    assert '"Remind me to X tomorrow at 3pm" is a task' in prompt
+    assert "Todoist sends the notification, not you" in prompt
 
 
 def test_system_prompt_explains_the_conversation_memory():

@@ -19,7 +19,7 @@ rules that are deliberately few:
 
 The messages are templates, not model output. They are reports; the agent loop
 is for requests; and a template cannot hallucinate a task. Your reply to a
-check-in goes through the normal agent with all five tools -- and with the
+check-in goes through the normal agent with all six tools -- and with the
 check-in in its conversation memory, so "push it to tomorrow" just works.
 
 Memory adds one thing to each report: a sentence of advice for a task the
