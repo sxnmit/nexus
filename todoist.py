@@ -1,9 +1,9 @@
-"""A thin Todoist REST client -- just the three calls Nexus needs.
+"""A thin Todoist REST client -- just the calls Nexus needs.
 
-Every failure (bad token, unparseable date, network trouble) becomes a
-TodoistError carrying a human-readable message. tools.py lets those propagate
-and the agent's tool node turns them into observations the model can react to,
-which is what stops it from claiming success on a call that failed.
+Every failure (bad token, network trouble, a rejected request) becomes a
+TodoistError. It carries `status_code` -- None when Todoist was never reached --
+because the agent's observe step decides what to do next from it: a 429 is
+worth one retry, a 401 is not.
 """
 
 import httpx
@@ -16,6 +16,10 @@ TIMEOUT = 15.0
 class TodoistError(RuntimeError):
     """A Todoist call failed. The message is written to be read by the model."""
 
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
 
 def _request(method: str, path: str, **kwargs) -> dict | list | None:
     url = f"{config.TODOIST_API_BASE}{path}"
@@ -27,7 +31,10 @@ def _request(method: str, path: str, **kwargs) -> dict | list | None:
 
     if response.status_code >= 400:
         detail = response.text.strip()[:300] or "no detail"
-        raise TodoistError(f"Todoist rejected the request: HTTP {response.status_code} - {detail}")
+        raise TodoistError(
+            f"Todoist rejected the request: HTTP {response.status_code} - {detail}",
+            status_code=response.status_code,
+        )
 
     if not response.content:
         return None
@@ -66,6 +73,30 @@ def get_tasks() -> list[dict]:
             break
 
     return tasks
+
+
+def get_task(task_id: str) -> dict:
+    """Fetch one task by id."""
+    return _request("GET", f"/tasks/{task_id}")
+
+
+def update_task(task_id: str, **fields) -> dict:
+    """Change a task's content, due_string and/or priority (API scale: 4 = urgent).
+
+    Returns the task as Todoist now has it. API v1 sends the updated task back;
+    should a server ever answer with an empty body instead, we fetch it -- the
+    caller's next step is to check that the change actually took.
+    """
+    payload = {key: value for key, value in fields.items() if value is not None}
+    data = _request("POST", f"/tasks/{task_id}", json=payload)
+    if isinstance(data, dict) and data:
+        return data
+    return get_task(task_id)
+
+
+def delete_task(task_id: str) -> None:
+    """Delete a task permanently. Returns 204 with an empty body on success."""
+    _request("DELETE", f"/tasks/{task_id}")
 
 
 def close_task(task_id: str) -> None:

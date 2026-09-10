@@ -51,6 +51,15 @@ TODOIST_API_BASE = os.getenv("TODOIST_API_BASE", "https://api.todoist.com/api/v1
 # single message. Stops a confused model from looping forever on your token bill.
 MAX_TOOL_LOOPS = int(os.getenv("NEXUS_MAX_TOOL_LOOPS", "6"))
 
+# After a failed tool call the observe step may grant a retry -- this many per
+# message. One is deliberate: a second identical failure is information, not
+# bad luck, and the user should hear about it.
+MAX_RETRIES = int(os.getenv("NEXUS_MAX_RETRIES", "1"))
+
+# Pause before retrying a rate limit or an outage, so the retry is not just a
+# faster way to hit the same wall. The tests set this to 0.
+RETRY_BACKOFF_SECONDS = float(os.getenv("NEXUS_RETRY_BACKOFF_SECONDS", "2"))
+
 
 def _parse_user_ids(raw: str) -> set[int]:
     """Parse "123, 456" into {123, 456}. Ignores blanks and non-numeric entries."""

@@ -1,4 +1,6 @@
-"""Tests for the LangGraph agent loop: routing, the two nodes, and whole runs."""
+"""Tests for the LangGraph agent loop: routing, the nodes, and whole runs.
+
+The observe/replan step has its own file, tests/test_replan.py."""
 
 from datetime import datetime
 
@@ -21,12 +23,13 @@ TWO_REVIEWS = [
 def test_graph_has_exactly_the_documented_shape():
     graph = agent.build_graph(ScriptedModel()).get_graph()
 
-    assert set(graph.nodes) == {"__start__", "agent", "tools", "__end__"}
+    assert set(graph.nodes) == {"__start__", "agent", "tools", "observe", "__end__"}
     assert {(e.source, e.target) for e in graph.edges} == {
         ("__start__", "agent"),
         ("agent", "tools"),
         ("agent", "__end__"),
-        ("tools", "agent"),
+        ("tools", "observe"),
+        ("observe", "agent"),
     }
 
 
@@ -55,7 +58,7 @@ def test_check_model_makes_exactly_one_tiny_request(monkeypatch):
     assert len(calls) == 1 and len(calls[0]) == 1
 
 
-def test_build_graph_binds_the_real_model_to_the_three_tools_by_default():
+def test_build_graph_binds_the_real_model_to_the_five_tools_by_default():
     model = agent._build_model()
 
     assert model.bound.model == config.MODEL
@@ -63,6 +66,8 @@ def test_build_graph_binds_the_real_model_to_the_three_tools_by_default():
         "create_task",
         "list_tasks",
         "complete_task",
+        "update_task",
+        "delete_task",
     ]
     assert agent.build_graph() is not None
 
@@ -95,13 +100,25 @@ def test_route_treats_a_missing_step_count_as_zero():
 def test_agent_node_prepends_the_system_prompt_and_counts_the_step():
     model = ScriptedModel(AIMessage("hi"))
 
-    out = agent._agent_node({"messages": [HumanMessage("hello")], "steps": 2}, model)
+    out = agent._agent_node({"messages": [HumanMessage("hello")], "steps": 2}, model, model)
 
     sent = model.seen[0]
     assert isinstance(sent[0], SystemMessage)
     assert sent[0].content.startswith("You are Nexus")
     assert sent[1:] == [HumanMessage("hello")]
-    assert out == {"messages": [AIMessage("hi")], "steps": 3}
+    assert out == {"messages": [AIMessage("hi")], "steps": 3, "mode": "act"}
+
+
+def test_agent_node_picks_the_model_by_mode_and_says_so_in_the_prompt():
+    acting, responding = ScriptedModel(AIMessage("act")), ScriptedModel(AIMessage("respond"))
+    state = {"messages": [HumanMessage("x")], "steps": 0}
+
+    agent._agent_node({**state, "mode": "retry"}, acting, responding)
+    agent._agent_node({**state, "mode": "respond"}, acting, responding)
+
+    assert acting.calls == 1 and responding.calls == 1
+    assert "follow its repair note" in acting.seen[0][0].content.lower()
+    assert "cannot use tools" in responding.seen[0][0].content
 
 
 def test_system_prompt_carries_todays_date():
@@ -109,12 +126,13 @@ def test_system_prompt_carries_todays_date():
 
 
 def test_system_prompt_spells_out_the_error_handling_contract():
-    prompt = agent._system_prompt()
+    prompt = agent._system_prompt().lower()
     assert "never tell the user something worked when the tool said it did not" in prompt
     assert "clarifying question" in prompt
+    assert "observer:" in prompt, "the model must be told what the verdict line is"
 
 
-# --- _tool_node: act + observe -------------------------------------------------
+# --- _tool_node: act ------------------------------------------------------------
 
 
 def test_tool_node_returns_one_observation_per_call_with_matching_ids(todoist_api):
@@ -131,13 +149,14 @@ def test_tool_node_returns_one_observation_per_call_with_matching_ids(todoist_ap
 
 
 def test_tool_node_turns_an_exception_into_an_error_observation(todoist_api):
-    todoist_api(fail="Todoist rejected the request: HTTP 500 - boom")
+    todoist_api(fail="Todoist rejected the request: HTTP 500 - boom", fail_status=500)
 
     out = agent._tool_node({"messages": [tool_call("list_tasks", {})]})["messages"]
 
     assert out[0].status == "error"
-    assert out[0].content == "TodoistError: Todoist rejected the request: HTTP 500 - boom"
+    assert out[0].content == "Todoist rejected the request: HTTP 500 - boom"
     assert out[0].tool_call_id == "call-1"
+    assert out[0].artifact == {"outcome": "api_error", "status_code": 500}
 
 
 def test_tool_node_reports_an_unknown_tool_instead_of_crashing():
@@ -154,6 +173,7 @@ def test_tool_node_keeps_going_after_one_call_fails(todoist_api):
     out = agent._tool_node(state)["messages"]
 
     assert [m.status for m in out] == ["error", "success"]
+    assert [m.artifact["outcome"] for m in out] == ["clarify", "ok"]
 
 
 # --- Whole runs: the happy paths ----------------------------------------------
@@ -221,23 +241,6 @@ def test_the_system_prompt_is_sent_exactly_once_per_model_call(ask, todoist_api)
 # --- Whole runs: the error paths ----------------------------------------------
 
 
-def test_the_model_can_recover_from_a_failed_call_by_retrying(ask, todoist_api):
-    """Round 1 is ambiguous, round 2 uses the id the error showed it."""
-    todo = todoist_api(tasks=TWO_REVIEWS)
-    model = ScriptedModel(
-        tool_call("complete_task", {"task": "review"}),
-        tool_call("complete_task", {"task": "1"}, "call-2"),
-        AIMessage("Done - completed 'Submit iTrade PR review'."),
-    )
-
-    reply = ask(model, "mark the PR review done")
-
-    assert [o.status for o in model.observations(turn=1)] == ["error"]
-    assert [o.status for o in model.observations(turn=2)] == ["error", "success"]
-    assert todo.closed == ["1"]
-    assert reply.startswith("Done")
-
-
 def test_an_ambiguous_match_lets_the_model_ask_instead_of_guessing(ask, todoist_api):
     todo = todoist_api(tasks=TWO_REVIEWS)
     model = ScriptedModel(
@@ -251,12 +254,14 @@ def test_an_ambiguous_match_lets_the_model_ask_instead_of_guessing(ask, todoist_
     assert observation.status == "error"
     assert "Submit iTrade PR review" in observation.content
     assert "Review the design doc" in observation.content
+    assert "Observer: only the user can resolve this" in observation.content
+    assert model.tools_bound == [True, False], "the asking turn must not be able to call tools"
     assert todo.closed == []
     assert reply.startswith("Which one")
 
 
-def test_a_todoist_outage_reaches_the_model_as_an_error_not_a_crash(ask, todoist_api):
-    todoist_api(fail="Todoist rejected the request: HTTP 401 - unauthorised")
+def test_a_rejected_token_reaches_the_model_as_a_fail_verdict_not_a_crash(ask, todoist_api):
+    todoist_api(fail="Todoist rejected the request: HTTP 401 - unauthorised", fail_status=401)
     model = ScriptedModel(
         tool_call("create_task", {"content": "Buy milk", "due_string": ""}),
         AIMessage("Todoist rejected that - your API token looks wrong."),
@@ -267,6 +272,8 @@ def test_a_todoist_outage_reaches_the_model_as_an_error_not_a_crash(ask, todoist
     observation = model.observations()[0]
     assert observation.status == "error"
     assert "401" in observation.content
+    assert "Observer: Todoist refused our credentials" in observation.content
+    assert model.tools_bound == [True, False], "nothing to retry, so no tools on the reply turn"
     assert reply.startswith("Todoist rejected that")
 
 
@@ -279,7 +286,10 @@ def test_an_unparsed_due_date_is_reported_rather_than_confirmed(ask, todoist_api
 
     ask(model, "remind me to call mum sometime soonish")
 
-    assert "could not understand the due date 'sometime soonish'" in model.observations()[0].content
+    observation = model.observations()[0]
+    assert "did not understand the due date 'sometime soonish'" in observation.content
+    assert "Observer: RETRY once" in observation.content
+    assert "do not call create_task again" in observation.content
 
 
 def test_the_loop_is_capped_and_the_user_is_told(ask, todoist_api):

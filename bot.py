@@ -29,7 +29,9 @@ GREETING = (
     "Try:\n"
     "  remind me to submit the iTrade PR review tomorrow at 3pm\n"
     "  what's on my list?\n"
-    "  mark the PR review done"
+    "  mark the PR review done\n"
+    "  move the PR review to friday 5pm\n"
+    "  delete the milk task"
 )
 
 

@@ -52,3 +52,40 @@ jobs:
         with:
           name: coverage-xml
           path: coverage.xml
+
+  image:
+    name: Docker image builds and boots
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t nexus .
+
+      - name: Boot it with placeholder tokens
+        # bot.py must get as far as its first startup check and stop cleanly
+        # there. That proves the interpreter, every dependency, config loading
+        # and the network layer all work inside the image -- everything except
+        # the real APIs. Exit 1 with "Todoist check failed" is the expected
+        # result; an import error, a crash or a hang fails the job.
+        run: |
+          set +e
+          output=$(timeout 120 docker run --rm \
+            -e PERSONAL_ACCESS_TOKEN_CLAUDE=placeholder \
+            -e API_TOKEN_TODOIST=placeholder \
+            -e API_TOKEN_TELEGRAM=placeholder \
+            nexus 2>&1)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ "$status" -ne 1 ]; then
+            echo "::error::expected exit status 1 from the startup check, got $status"
+            exit 1
+          fi
+          if ! printf '%s\n' "$output" | grep -q "Todoist check failed"; then
+            echo "::error::expected the Todoist startup check to be what stopped it"
+            exit 1
+          fi
+          echo "OK: the image boots and stops at the Todoist check, as it must without real tokens"
