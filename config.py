@@ -6,6 +6,8 @@ fails loudly and immediately instead of halfway through a conversation.
 """
 
 import os
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -74,6 +76,68 @@ def _parse_user_ids(raw: str) -> set[int]:
 # Optional comma-separated Telegram user IDs. Empty means anyone who finds the
 # bot can edit your Todoist -- set this once you know your own ID.
 ALLOWED_TELEGRAM_USER_IDS = _parse_user_ids(os.getenv("TELEGRAM_ALLOWED_USER_IDS", ""))
+
+
+# --- Proactive messages ---------------------------------------------------------------
+# A setting that cannot be parsed is recorded here and the default is used, so
+# importing config never raises; bot.py reports config_errors() at startup and
+# refuses to run, which is where the mistake is cheapest to fix.
+_ERRORS: list[str] = []
+
+
+def _setting(var: str, default: str, parse):
+    raw = os.getenv(var, default)
+    try:
+        return parse(raw)
+    except (ValueError, KeyError) as exc:  # ZoneInfoNotFoundError is a KeyError
+        _ERRORS.append(f"{var}={raw!r}: {exc}")
+        return parse(default)
+
+
+def _parse_timezone(name: str):
+    """Unset means the machine's local zone -- right on a laptop, but a container
+    is usually UTC, so set NEXUS_TIMEZONE on a host or "8am" is 8am UTC."""
+    return ZoneInfo(name) if name else datetime.now().astimezone().tzinfo
+
+
+def _parse_clock(raw: str) -> time:
+    hour, minute = raw.strip().split(":")
+    return time(int(hour), int(minute))
+
+
+def _parse_window(raw: str) -> tuple[time, time]:
+    start, end = raw.split("-")
+    return _parse_clock(start), _parse_clock(end)
+
+
+def _parse_chat_id(raw: str) -> int | None:
+    return int(raw) if raw.strip() else None
+
+
+TIMEZONE = _setting("NEXUS_TIMEZONE", "", _parse_timezone)
+MORNING_TIME = _setting("NEXUS_MORNING_TIME", "08:00", _parse_clock)
+EVENING_TIME = _setting("NEXUS_EVENING_TIME", "21:00", _parse_clock)
+QUIET_HOURS = _setting("NEXUS_QUIET_HOURS", "22:00-07:00", _parse_window)
+OVERDUE_CHECK_MINUTES = _setting("NEXUS_OVERDUE_CHECK_MINUTES", "15", int)
+
+
+def _chat_id(explicit: int | None, allowed: set[int]) -> int | None:
+    """Where proactive messages go. An explicit id wins; otherwise, in a private
+    chat with the bot your user id is the chat id, so a one-person allowlist is
+    the obvious answer. Anything else means off."""
+    if explicit is not None:
+        return explicit
+    return next(iter(allowed)) if len(allowed) == 1 else None
+
+
+TELEGRAM_CHAT_ID = _chat_id(
+    _setting("TELEGRAM_CHAT_ID", "", _parse_chat_id), ALLOWED_TELEGRAM_USER_IDS
+)
+
+
+def config_errors() -> list[str]:
+    """Settings that could not be parsed (the default was used in their place)."""
+    return list(_ERRORS)
 
 
 def missing_settings() -> list[str]:

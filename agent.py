@@ -197,7 +197,7 @@ def classify(artifact: dict, retries_used: int) -> Verdict:
 def _system_prompt(mode: str = "act") -> str:
     # Rebuilt per call so the model always knows today's date -- it needs that to
     # sanity-check and echo back due dates like "tomorrow at 3pm".
-    now = datetime.now().astimezone()
+    now = datetime.now(config.TIMEZONE)
     return SYSTEM_PROMPT.format(
         now=now.strftime("%A %d %B %Y, %H:%M %Z"), mode_note=MODE_NOTES.get(mode, "")
     )

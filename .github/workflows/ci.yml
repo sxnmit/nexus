@@ -76,6 +76,7 @@ jobs:
             -e PERSONAL_ACCESS_TOKEN_CLAUDE=placeholder \
             -e API_TOKEN_TODOIST=placeholder \
             -e API_TOKEN_TELEGRAM=placeholder \
+            -e NEXUS_TIMEZONE=America/Toronto \
             nexus 2>&1)
           status=$?
           set -e

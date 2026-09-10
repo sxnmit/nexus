@@ -5,6 +5,9 @@ anthropic==1.4.0
 langchain-anthropic==1.7.1
 langchain-core==1.6.2
 langgraph==1.2.11
-python-telegram-bot==22.8
+python-telegram-bot[job-queue]==22.8  # the extra is APScheduler, for the check-ins
+APScheduler==3.11.3
+tzlocal==5.4.4
+tzdata==2026.3  # zone data for NEXUS_TIMEZONE; slim Docker images ship none
 python-dotenv==1.2.3
 httpx==0.28.1
