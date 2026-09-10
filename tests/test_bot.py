@@ -5,6 +5,8 @@ here talks to Telegram.
 """
 
 import asyncio
+import logging
+from datetime import datetime, time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -188,21 +190,63 @@ def test_main_exits_when_claude_rejects_the_key(monkeypatch, todoist_api):
     assert "ANTHROPIC_WORKSPACE_ID" in message, "should point at the fix"
 
 
-def test_main_wires_the_handlers_and_starts_polling(monkeypatch, todoist_api):
+def boot(monkeypatch, todoist_api, chat_id):
+    """Everything main() needs, faked, with the proactive recipient set to `chat_id`."""
     monkeypatch.setattr(config, "missing_settings", lambda: [])
+    monkeypatch.setattr(config, "TELEGRAM_CHAT_ID", chat_id)
     todoist_api(tasks=[])
-    app = SimpleNamespace(bot_data={}, add_handler=Mock(), run_polling=Mock())
+    queue = SimpleNamespace(run_daily=Mock(), run_repeating=Mock())
+    app = SimpleNamespace(bot_data={}, add_handler=Mock(), run_polling=Mock(), job_queue=queue)
     builder = SimpleNamespace(token=lambda token: SimpleNamespace(build=lambda: app))
     monkeypatch.setattr(bot.Application, "builder", lambda: builder)
     monkeypatch.setattr(bot, "build_graph", lambda: "the-graph")
     monkeypatch.setattr(bot, "check_model", lambda: None)
+    return app
 
-    bot.main()
+
+def test_main_wires_the_handlers_and_starts_polling(monkeypatch, todoist_api, caplog):
+    app = boot(monkeypatch, todoist_api, chat_id=None)
+
+    with caplog.at_level(logging.WARNING, logger="nexus"):
+        bot.main()
 
     assert app.bot_data["graph"] == "the-graph"
     handler_types = [type(call.args[0]).__name__ for call in app.add_handler.call_args_list]
     assert handler_types == ["CommandHandler", "MessageHandler"]
     app.run_polling.assert_called_once()
+    assert app.job_queue.run_daily.call_count == 0, "no recipient, so no check-ins"
+    assert "Proactive messages OFF" in caplog.text
+
+
+def test_main_schedules_the_check_ins_when_there_is_a_recipient(monkeypatch, todoist_api):
+    app = boot(monkeypatch, todoist_api, chat_id=42)
+
+    bot.main()
+
+    names = [call.kwargs["name"] for call in app.job_queue.run_daily.call_args_list]
+    assert names == ["morning", "evening"]
+    assert app.job_queue.run_repeating.call_args.kwargs["name"] == "overdue"
+
+
+def test_main_exits_on_a_setting_it_could_not_parse(monkeypatch, todoist_api):
+    boot(monkeypatch, todoist_api, chat_id=None)
+    monkeypatch.setattr(
+        config, "config_errors", lambda: ["NEXUS_QUIET_HOURS='garbage': not enough values"]
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        bot.main()
+
+    assert "Bad settings" in str(excinfo.value)
+    assert "NEXUS_QUIET_HOURS" in str(excinfo.value)
+
+
+def test_sender_sends_through_the_apps_bot():
+    app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+
+    asyncio.run(bot._sender(app)(42, "hi"))
+
+    app.bot.send_message.assert_awaited_once_with(chat_id=42, text="hi")
 
 
 # --- config -------------------------------------------------------------------
@@ -239,3 +283,68 @@ def test_model_defaults_to_haiku():
 
 def test_max_tokens_defaults_to_a_telegram_sized_ceiling():
     assert config.MAX_TOKENS == 1024
+
+
+# --- config: proactive settings -----------------------------------------------
+
+
+def test_parse_clock_and_window():
+    assert config._parse_clock("08:00") == time(8, 0)
+    assert config._parse_clock(" 21:30 ") == time(21, 30)
+    assert config._parse_window("22:00-07:00") == (time(22, 0), time(7, 0))
+    with pytest.raises(ValueError):
+        config._parse_clock("8am")
+    with pytest.raises(ValueError):
+        config._parse_window("22:00")
+
+
+def test_parse_chat_id():
+    assert config._parse_chat_id("") is None
+    assert config._parse_chat_id(" 42 ") == 42
+    with pytest.raises(ValueError):
+        config._parse_chat_id("me")
+
+
+def test_parse_timezone_by_name_or_machine_default():
+    assert str(config._parse_timezone("America/Toronto")) == "America/Toronto"
+    assert config._parse_timezone("") == datetime.now().astimezone().tzinfo
+
+
+def test_setting_records_a_bad_value_and_uses_the_default(monkeypatch):
+    monkeypatch.setattr(config, "_ERRORS", [])
+    monkeypatch.setenv("NEXUS_MORNING_TIME", "eight")
+
+    assert config._setting("NEXUS_MORNING_TIME", "08:00", config._parse_clock) == time(8, 0)
+    assert config.config_errors()[0].startswith("NEXUS_MORNING_TIME='eight'")
+
+
+def test_setting_falls_back_to_the_machine_zone_for_an_unknown_timezone(monkeypatch):
+    monkeypatch.setattr(config, "_ERRORS", [])
+    monkeypatch.setenv("NEXUS_TIMEZONE", "Mars/Olympus")
+
+    zone = config._setting("NEXUS_TIMEZONE", "", config._parse_timezone)
+
+    assert zone == datetime.now().astimezone().tzinfo
+    assert config.config_errors()[0].startswith("NEXUS_TIMEZONE='Mars/Olympus'")
+
+
+def test_setting_is_quiet_about_a_good_value(monkeypatch):
+    monkeypatch.setattr(config, "_ERRORS", [])
+    monkeypatch.setenv("NEXUS_OVERDUE_CHECK_MINUTES", "30")
+
+    assert config._setting("NEXUS_OVERDUE_CHECK_MINUTES", "15", int) == 30
+    assert config.config_errors() == []
+
+
+def test_proactive_defaults():
+    assert time(8, 0) == config.MORNING_TIME
+    assert time(21, 0) == config.EVENING_TIME
+    assert (time(22, 0), time(7, 0)) == config.QUIET_HOURS
+    assert config.OVERDUE_CHECK_MINUTES == 15
+
+
+def test_chat_id_rule():
+    assert config._chat_id(5, {9}) == 5, "an explicit id wins"
+    assert config._chat_id(None, {9}) == 9, "a one-person allowlist names the recipient"
+    assert config._chat_id(None, {9, 10}) is None, "two people: ambiguous, so off"
+    assert config._chat_id(None, set()) is None

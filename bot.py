@@ -19,6 +19,7 @@ from telegram.ext import (
 import config
 import todoist
 from agent import build_graph, check_model, run
+from scheduler import Proactive, Window, schedule_jobs
 
 logging.basicConfig(format="%(asctime)s  %(levelname)-7s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -31,7 +32,9 @@ GREETING = (
     "  what's on my list?\n"
     "  mark the PR review done\n"
     "  move the PR review to friday 5pm\n"
-    "  delete the milk task"
+    "  delete the milk task\n\n"
+    f"I'll also check in at {config.MORNING_TIME:%H:%M} with what's due and at "
+    f"{config.EVENING_TIME:%H:%M} with what got done."
 )
 
 
@@ -73,6 +76,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(reply)
 
 
+def _sender(app):
+    """How proactive messages leave: the same bot, addressed by chat id."""
+
+    async def send(chat_id: int, text: str) -> None:
+        await app.bot.send_message(chat_id=chat_id, text=text)
+
+    return send
+
+
 def main() -> None:
     missing = config.missing_settings()
     if missing:
@@ -80,6 +92,12 @@ def main() -> None:
             "Missing environment variables: "
             + ", ".join(missing)
             + "\nCopy .env.example to .env and fill them in."
+        )
+
+    problems = config.config_errors()
+    if problems:
+        raise SystemExit(
+            "Bad settings:\n  " + "\n  ".join(problems) + "\nSee .env.example for the formats."
         )
 
     # Check Todoist now rather than discovering a bad token mid-conversation.
@@ -118,6 +136,27 @@ def main() -> None:
     app.bot_data["graph"] = build_graph()
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+
+    log.info("Timezone: %s", config.TIMEZONE)
+    proactive = Proactive(
+        send=_sender(app), chat_id=config.TELEGRAM_CHAT_ID, quiet=Window(*config.QUIET_HOURS)
+    )
+    if proactive.enabled:
+        schedule_jobs(app, proactive)
+        log.info(
+            "Proactive: morning %s, evening %s, overdue check every %d min, quiet %s-%s, chat %s",
+            f"{config.MORNING_TIME:%H:%M}",
+            f"{config.EVENING_TIME:%H:%M}",
+            config.OVERDUE_CHECK_MINUTES,
+            f"{config.QUIET_HOURS[0]:%H:%M}",
+            f"{config.QUIET_HOURS[1]:%H:%M}",
+            config.TELEGRAM_CHAT_ID,
+        )
+    else:
+        log.warning(
+            "Proactive messages OFF: set TELEGRAM_CHAT_ID (or exactly one id in "
+            "TELEGRAM_ALLOWED_USER_IDS) to get the morning and evening check-ins."
+        )
 
     log.info("Nexus is polling. Ctrl-C to stop.")
     app.run_polling()

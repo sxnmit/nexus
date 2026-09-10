@@ -316,6 +316,7 @@ package.
 | `tools.py`          | The five Todoist tools, raising typed failures that `observe` reads.|
 | `todoist.py`        | Thin HTTP client for the three Todoist calls. Raises `TodoistError`.|
 | `config.py`         | Reads `.env`. Nothing raises on import; `bot.py` validates at start.|
+| `scheduler.py`      | Stage 3: the quiet-hours gate and the three time-triggered jobs.   |
 | `tests/`            | The suite. `support.py` has the fakes, `conftest.py` the fixtures, `test_replan.py` Stage 2. |
 | `Dockerfile`        | Runs the bot as a worker. Used by any host that takes a Dockerfile. |
 | `Procfile`          | Same thing for buildpack/nixpacks hosts. Declares a `worker`, not a `web`. |
@@ -382,6 +383,111 @@ thinking tokens count against `max_tokens`, so raise `NEXUS_MAX_TOKENS` to
 ~8192 when you switch. `run()` already handles the block-style content a
 thinking model returns.
 
+## Proactive messages
+
+Stage 3 gives Nexus a second trigger: the clock. [`scheduler.py`](scheduler.py)
+runs three jobs on python-telegram-bot's `JobQueue` -- APScheduler underneath --
+on the same event loop as polling, so a job can send with the same bot and
+nothing needs a second process.
+
+| Job              | When                                              | Says                                                       |
+| ---------------- | ------------------------------------------------- | ---------------------------------------------------------- |
+| Morning check-in | `NEXUS_MORNING_TIME`, default 08:00               | What's due today, what's overdue, "want to move anything?" |
+| Evening review   | `NEXUS_EVENING_TIME`, default 21:00               | What got done today vs what's still open                   |
+| Overdue nudge    | every `NEXUS_OVERDUE_CHECK_MINUTES`, default 15   | A timed task that just went overdue -- once                |
+
+### What triggers a proactive message, and what waits for you
+
+This is the design decision worth being able to defend, so here it is as
+rules rather than as code:
+
+1. **Only the clock or a state transition triggers a message. Never
+   inference.** The bot does not message because it *thinks* you might want
+   something. Morning and evening fire because a configured time passed; a
+   nudge fires because a task crossed from due to overdue. Anything else --
+   "you have a lot on today", "you haven't touched X in a week" -- waits for
+   you to ask, because a proactive message you didn't want is a notification
+   you'll learn to ignore, and then the ones that matter go with it.
+2. **A transition is reported once.** The nudge job remembers what it has
+   nudged and never repeats it. The morning check-in may list an overdue task
+   again tomorrow, but that is the day's anchor restating today's state, not
+   a repeat of the same event -- and it marks what it listed so the nudge job
+   doesn't pile on fifteen minutes later.
+3. **Silence when there is nothing to say.** The evening review skips if
+   nothing was due; the nudge job skips if nothing went overdue; an outage
+   during a nudge check is logged, not messaged (once every fifteen minutes
+   would be nagging). The one exception is the morning check-in, which always
+   sends: a daily "nothing due" is a useful anchor, and its absence would be
+   the real signal that something is wrong.
+4. **Quiet hours are absolute for proactive messages and irrelevant for
+   replies.** Ask at 3am and you get an answer; the bot won't *start* a
+   conversation then. A nudge that lands in quiet hours isn't dropped -- it
+   simply isn't marked as sent, so the first check after 07:00 sends it.
+
+All of that lives in one place. Every unprompted message passes through
+`Proactive.deliver()`, which enforces the recipient, quiet hours and the size
+limit, and logs what happened. The jobs decide *what* to say; the gate decides
+*whether* it may be said now. It's the same shape as Stage 2's `classify`:
+policy in one function, table-tested, explainable.
+
+### Templates, not the model
+
+Proactive messages are written by templates, not by Claude. They are
+*reports*; the agent loop is for *requests*. A template is deterministic,
+tested to the character, costs nothing at three sends a day, and cannot
+hallucinate a task. Your *reply* to a check-in goes through the normal agent
+with all five tools, so "push the PR review to tomorrow" works exactly as it
+does any other time. Claude joins proactive messaging in Stage 4, when there is
+a learned pattern worth phrasing -- "you've pushed gym four times this month;
+move it?" -- and phrasing is what a model is for.
+
+### Where "done vs still open" comes from
+
+Todoist's completed-tasks endpoint is one more thing that couldn't be verified
+from where this was written, so the evening review doesn't need it. The morning
+check-in snapshots what's due; the evening diffs that against what is still
+open. Gone from the open list = done; still there = still open.
+
+Two limits follow, both fixed by the persistent log in Stage 4. The snapshot is
+in memory, so a restart between the two jobs loses it -- and the evening
+message says so ("I started at 2:00pm, so I can't see what got done before
+that") rather than pretending nothing was done. And a task created *and*
+finished within the day is invisible to the diff.
+
+### Why the nudge only watches timed tasks
+
+A task "due today" with no time becomes overdue at midnight -- inside quiet
+hours -- and is exactly what the 08:00 check-in reports as overdue. Nudging it
+at 07:00 and listing it again at 08:00 is the nagging rule 2 exists to prevent.
+So the nudge job only watches tasks with a clock time ("was due 3:00pm, 20 min
+ago"), and only ones that went overdue in the last 24 hours, so a restart can't
+re-nudge last week. Tasks it has already nudged live in memory too; a restart
+may nudge a recent one twice. Stage 4.
+
+### Timezone
+
+"8am" on a host means 8am UTC unless the bot is told otherwise. Set
+`NEXUS_TIMEZONE` (an IANA name such as `America/Toronto`) wherever the
+machine's clock isn't yours -- Railway, Docker -- and both the check-ins and
+the model's "right now it is..." line follow it. Unset, it uses the machine's
+local zone, which is right on a laptop. `bot.py` logs the zone it resolved at
+startup, so a wrong one shows up in the first line.
+
+### Settings
+
+| Variable                      | Default       | Meaning                                                              |
+| ----------------------------- | ------------- | -------------------------------------------------------------------- |
+| `TELEGRAM_CHAT_ID`            | *(see right)* | Where check-ins go. Defaults to the sole allowlisted id; unset = off |
+| `NEXUS_TIMEZONE`              | machine local | IANA zone for the times below and the model's clock                  |
+| `NEXUS_MORNING_TIME`          | `08:00`       | Morning check-in                                                     |
+| `NEXUS_EVENING_TIME`          | `21:00`       | Evening review                                                       |
+| `NEXUS_QUIET_HOURS`           | `22:00-07:00` | No proactive messages in this window; `22:00-22:00` disables it      |
+| `NEXUS_OVERDUE_CHECK_MINUTES` | `15`          | How often to look for timed tasks that went overdue                  |
+
+A value that can't be parsed doesn't crash the import; `bot.py` reports every
+such setting at startup and refuses to run, which is where the mistake is
+cheapest.
+
 ## Deploying
 
 Nexus is a **worker**, not a website: one long-lived process that polls Telegram
@@ -442,8 +548,10 @@ to dodge.
    that is expected.
 2. In the service, open **Variables** and add the contents of your `.env`:
    `PERSONAL_ACCESS_TOKEN_CLAUDE`, `API_TOKEN_TODOIST`, `API_TOKEN_TELEGRAM`,
-   `ANTHROPIC_WORKSPACE_ID` if your key needs it, and
-   `TELEGRAM_ALLOWED_USER_IDS`. Railway redeploys when variables change.
+   `ANTHROPIC_WORKSPACE_ID` if your key needs it, `TELEGRAM_ALLOWED_USER_IDS`,
+   and for the check-ins `NEXUS_TIMEZONE` and `TELEGRAM_CHAT_ID` -- the host's
+   clock is UTC, so without the zone "08:00" is 8am UTC. Railway redeploys
+   when variables change.
 3. In **Settings**, confirm **1 replica** and no public domain or port -- Nexus
    serves nothing. Leave the restart policy on its default, restart on failure.
 4. **Stop the bot on your laptop** before this deploy finishes. Two pollers on
@@ -489,9 +597,6 @@ the point of these first stages is understanding the loop, not accreting feature
   then persists per chat, "the second one" would mean something, and a
   clarifying question could actually be answered. The cost is that context
   grows every message and you need a policy for trimming it.
-- **Proactive / scheduled messages** ("remind me at 3pm" that pings *you*).
-  Needs a job runner alongside the polling loop and a way for the agent to
-  register jobs -- a sixth tool plus something like APScheduler.
 - **Multi-step planning.** The loop already handles "list, then complete the
   one that matches" because Claude chains tool calls itself. A planner node
   that writes down a plan first only pays off once tasks get long enough that
