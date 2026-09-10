@@ -310,14 +310,24 @@ class Proactive:
             log.warning("nudge: Todoist unavailable (%s)", exc)  # every 15 min: log, don't message
             return
 
-        fresh = []
+        fresh, timed, reported = [], 0, 0
         for task in tasks:
             _, when = todoist.parse_due(task)
-            if when is None or self._is_reported(task):
-                continue
-            if when <= now <= when + NUDGE_LOOKBACK:
+            if when is None:
+                continue  # day-only tasks are the morning check-in's job
+            timed += 1
+            if self._is_reported(task):
+                reported += 1
+            elif when <= now <= when + NUDGE_LOOKBACK:
                 fresh.append((when, task))
         if not fresh:
+            # Silence is the rule, but the log should say it was a choice.
+            log.info(
+                "nudge: nothing newly overdue (%d open tasks, %d with a time, %d already reported)",
+                len(tasks),
+                timed,
+                reported,
+            )
             return
 
         fresh.sort(key=lambda pair: pair[0])

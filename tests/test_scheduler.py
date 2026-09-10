@@ -6,6 +6,7 @@ fake. The jobs are coroutines, run with asyncio.run().
 """
 
 import asyncio
+import logging
 from datetime import date, datetime, time, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -424,7 +425,7 @@ def test_nudge_reports_a_timed_task_that_just_went_overdue_once(todoist_api):
     assert set(proactive.reported) == {"1"}
 
 
-def test_nudge_ignores_date_only_future_and_ancient_tasks(todoist_api):
+def test_nudge_ignores_date_only_future_and_ancient_tasks(todoist_api, caplog):
     todoist_api(
         tasks=[
             dated("date-only", "Overdue by date", day=8),
@@ -435,9 +436,13 @@ def test_nudge_ignores_date_only_future_and_ancient_tasks(todoist_api):
     )
     proactive, outbox, _ = make(now=at(15, 20))
 
-    run(proactive.overdue_nudge())
+    with caplog.at_level(logging.INFO, logger="nexus.proactive"):
+        run(proactive.overdue_nudge())
 
     assert outbox.sent == []
+    assert "nudge: nothing newly overdue (4 open tasks, 2 with a time, 0 already reported)" in (
+        caplog.text
+    ), "silence must be visibly a choice in the log"
 
 
 def test_nudge_skips_what_the_morning_checkin_already_reported(todoist_api):
