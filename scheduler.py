@@ -112,6 +112,12 @@ def _ago(delta: timedelta) -> str:
     return f"{hours}h {minutes:02d}m" if minutes else f"{hours}h"
 
 
+def _when(when: datetime, now: datetime) -> str:
+    """'6:00pm' today, otherwise '6:00pm on Sat 12 Sep'."""
+    clock = _clock(when)
+    return clock if when.date() == now.date() else f"{clock} on {when:%a %d %b}"
+
+
 def _line(task: dict, today: date) -> str:
     """One human line per task: name, then time / how overdue / priority."""
     day, when = todoist.parse_due(task)
@@ -315,7 +321,7 @@ class Proactive:
             log.warning("nudge: %s", outcome)  # every 15 min: log, don't message
             return outcome
 
-        fresh, timed, reported = [], 0, 0
+        fresh, timed, reported, upcoming = [], 0, 0, None
         for task in tasks:
             _, when = todoist.parse_due(task)
             if when is None:
@@ -325,12 +331,18 @@ class Proactive:
                 reported += 1
             elif when <= now <= when + NUDGE_LOOKBACK:
                 fresh.append((when, task))
+            elif when > now and (upcoming is None or when < upcoming[0]):
+                upcoming = (when, task)
         if not fresh:
-            # Silence is the rule, but the log should say it was a choice.
+            # Silence is the rule, but the log should say it was a choice --
+            # and name the next task that will end it.
             outcome = (
                 f"nothing newly overdue ({len(tasks)} open tasks, {timed} with a time, "
                 f"{reported} already reported)"
             )
+            if upcoming is not None:
+                when, task = upcoming
+                outcome += f"; next up: '{task.get('content')}' at {_when(when, now)}"
             log.info("nudge: %s", outcome)
             return outcome
 

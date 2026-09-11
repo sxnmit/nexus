@@ -442,9 +442,19 @@ def test_nudge_ignores_date_only_future_and_ancient_tasks(todoist_api, caplog):
         run(proactive.overdue_nudge())
 
     assert outbox.sent == []
-    assert "nudge: nothing newly overdue (4 open tasks, 2 with a time, 0 already reported)" in (
-        caplog.text
-    ), "silence must be visibly a choice in the log"
+    assert (
+        "nudge: nothing newly overdue (4 open tasks, 2 with a time, 0 already reported); "
+        "next up: 'Later today' at 6:00pm" in caplog.text
+    ), "silence must be visibly a choice in the log, and say what ends it"
+
+
+def test_nudge_names_the_next_timed_task_even_on_another_day(todoist_api):
+    todoist_api(tasks=[timed("1", "Exam", 13, day=12), timed("2", "Later", 9, day=13)])
+    proactive, _, _ = make(now=at(15, 20))
+
+    outcome = run(proactive.overdue_nudge())
+
+    assert outcome.endswith("; next up: 'Exam' at 1:00pm on Sat 12 Sep")
 
 
 def test_nudge_skips_what_the_morning_checkin_already_reported(todoist_api):
