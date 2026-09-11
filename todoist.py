@@ -6,6 +6,10 @@ because the agent's observe step decides what to do next from it: a 429 is
 worth one retry, a 401 is not.
 """
 
+import json
+import uuid
+from datetime import date, datetime
+
 import httpx
 
 import config
@@ -102,3 +106,119 @@ def delete_task(task_id: str) -> None:
 def close_task(task_id: str) -> None:
     """Mark a task complete. Returns 204 with an empty body on success."""
     _request("POST", f"/tasks/{task_id}/close")
+
+
+# --- Reminders: the Sync side of the API --------------------------------------------
+# Reminders never appear on the task endpoints above. They live behind the
+# older Sync protocol: one POST that applies a batch of commands and/or reads
+# back whole resource types. Nexus uses exactly three commands.
+
+
+def sync(commands: list[dict] | None = None, resource_types: list[str] | None = None) -> dict:
+    """One call to the Sync endpoint: apply `commands`, read back `resource_types`.
+
+    A command that fails raises TodoistError carrying the error Todoist gave and
+    its HTTP code, so the observe step can judge it and a caller never mistakes
+    a half-applied batch for success.
+    """
+    form: dict[str, str] = {}
+    if commands:
+        form["commands"] = json.dumps(commands)
+    if resource_types:
+        form["sync_token"] = "*"  # a full read, not an incremental one
+        form["resource_types"] = json.dumps(resource_types)
+    result = _request("POST", "/sync", data=form) or {}
+
+    for command in commands or []:
+        status = (result.get("sync_status") or {}).get(command["uuid"])
+        if status == "ok":
+            continue
+        if isinstance(status, dict):
+            raise TodoistError(
+                f"Todoist rejected the request: {status.get('error') or 'no detail'}",
+                status_code=status.get("http_code"),
+            )
+        raise TodoistError("Todoist returned no status for the request.")
+    return result
+
+
+def _command(kind: str, args: dict) -> dict:
+    # Both ids must be UUIDs; anything else is "Invalid temporary id".
+    return {"type": kind, "temp_id": str(uuid.uuid4()), "uuid": str(uuid.uuid4()), "args": args}
+
+
+def get_reminders(task_id: str) -> list[dict]:
+    """The reminders on one task, as Todoist holds them (deleted ones dropped)."""
+    result = sync(resource_types=["reminders"])
+    return [
+        reminder
+        for reminder in result.get("reminders") or []
+        if str(reminder.get("item_id")) == str(task_id) and not reminder.get("is_deleted")
+    ]
+
+
+def add_reminder(
+    task_id: str, *, minute_offset: int | None = None, due_string: str | None = None
+) -> dict | None:
+    """Add one reminder: `minute_offset` minutes before the task's due time, or
+    at `due_string` in the user's own words.
+
+    Returns the reminder as Todoist holds it afterwards -- which includes the
+    moment it will fire -- or None if Todoist said OK but the reminder is not
+    on the task. Reading it back is the "verify, don't trust" rule again.
+    """
+    args: dict = {"item_id": str(task_id)}
+    if minute_offset is not None:
+        args.update(type="relative", minute_offset=int(minute_offset))
+    else:
+        args.update(type="absolute", due={"string": due_string})
+    command = _command("reminder_add", args)
+
+    result = sync(commands=[command])
+    new_id = (result.get("temp_id_mapping") or {}).get(command["temp_id"])
+    for reminder in get_reminders(task_id):
+        if str(reminder.get("id")) == str(new_id):
+            return reminder
+    return None
+
+
+def delete_reminder(reminder_id: str) -> None:
+    sync(commands=[_command("reminder_delete", {"id": str(reminder_id)})])
+
+
+# --- Reading a task's due fields ------------------------------------------------------
+
+
+def parse_due(task: dict) -> tuple[date | None, datetime | None]:
+    """(calendar day, exact moment) for a task, in the configured timezone.
+
+    Todoist gives `due.date` as a calendar day and, for tasks with a time,
+    `due.datetime` as RFC 3339 -- UTC with a Z, or a floating local time with
+    no zone. Some API versions put the timestamp in `date` itself. All three
+    shapes end up here as an aware datetime in NEXUS_TIMEZONE, or None for a
+    task with a day but no time.
+    """
+    due = task.get("due") or {}
+    raw_date = due.get("date") or ""
+    raw_dt = due.get("datetime") or (raw_date if "T" in raw_date else None)
+
+    when = None
+    if raw_dt:
+        when = datetime.fromisoformat(raw_dt.replace("Z", "+00:00"))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=config.TIMEZONE)  # floating: it means local
+        else:
+            when = when.astimezone(config.TIMEZONE)
+
+    if when is not None:
+        return when.date(), when
+    if raw_date:
+        return date.fromisoformat(raw_date[:10]), None
+    return None, None
+
+
+def due_key(task: dict) -> str:
+    """The due date exactly as Todoist states it, or "" -- for telling "the same
+    task, moved" from "the same task"."""
+    due = task.get("due") or {}
+    return due.get("datetime") or due.get("date") or ""

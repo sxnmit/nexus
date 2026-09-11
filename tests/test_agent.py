@@ -9,7 +9,7 @@ from langgraph.graph import END
 
 import agent
 import config
-from tests.support import ScriptedModel, tool_call, tool_calls
+from tests.support import ScriptedModel, log_rows, tool_call, tool_calls
 
 TWO_REVIEWS = [
     {"id": "1", "content": "Submit iTrade PR review"},
@@ -58,7 +58,7 @@ def test_check_model_makes_exactly_one_tiny_request(monkeypatch):
     assert len(calls) == 1 and len(calls[0]) == 1
 
 
-def test_build_graph_binds_the_real_model_to_the_five_tools_by_default():
+def test_build_graph_binds_the_real_model_to_the_six_tools_by_default():
     model = agent._build_model()
 
     assert model.bound.model == config.MODEL
@@ -68,6 +68,7 @@ def test_build_graph_binds_the_real_model_to_the_five_tools_by_default():
         "complete_task",
         "update_task",
         "delete_task",
+        "set_reminder",
     ]
     assert agent.build_graph() is not None
 
@@ -132,6 +133,27 @@ def test_system_prompt_spells_out_the_error_handling_contract():
     assert "observer:" in prompt, "the model must be told what the verdict line is"
 
 
+def test_system_prompt_tells_the_model_when_a_reminder_is_really_a_task():
+    prompt = agent._system_prompt()
+    assert "set_reminder" in prompt
+    assert '"Remind me to X tomorrow at 3pm" is a task' in prompt
+    assert "Todoist sends the notification, not you" in prompt
+
+
+def test_system_prompt_explains_the_conversation_memory():
+    prompt = agent._system_prompt()
+    assert "recent conversation" in prompt
+    assert agent.CHECK_IN_MARKER in prompt, "the model must know what the stand-in line means"
+
+
+def test_system_prompt_carries_the_memory_note():
+    assert "habits" not in agent._system_prompt()
+    assert agent._system_prompt(memory_note="\n\nhabits: x").endswith("habits: x")
+    assert agent._system_prompt("respond", "\n\nhabits: x").endswith(
+        "Do not claim anything was done."
+    )
+
+
 # --- _tool_node: act ------------------------------------------------------------
 
 
@@ -146,6 +168,11 @@ def test_tool_node_returns_one_observation_per_call_with_matching_ids(todoist_ap
     assert [m.name for m in out] == ["list_tasks", "complete_task"]
     assert [m.status for m in out] == ["success", "success"]
     assert out[1].content == "Completed [1] Buy milk"
+    assert out[0].artifact == {"outcome": "ok", "event": None}
+    assert out[1].artifact == {
+        "outcome": "ok",
+        "event": {"kind": "completed", "task": {"id": "1", "content": "Buy milk"}},
+    }, "the event rides in the artifact, which the model never sees"
 
 
 def test_tool_node_turns_an_exception_into_an_error_observation(todoist_api):
@@ -333,3 +360,156 @@ def test_run_extracts_text_from_content_blocks(ask):
     )
 
     assert ask(model, "x") == "Added it."
+
+
+# --- Memory around the graph --------------------------------------------------
+
+
+def shape(messages):
+    """(type, content) pairs -- messages that went through the graph carry ids."""
+    return [(type(m).__name__, m.content) for m in messages]
+
+
+def test_run_replays_the_recent_conversation_before_the_new_message(ask, memory):
+    memory.log(7, "user", "add gym tomorrow")
+    memory.log(7, "assistant", "Added 'Gym', due tomorrow.", kind="reply")
+    model = ScriptedModel(AIMessage("Moved it to friday."))
+
+    ask(model, "actually make it friday")
+
+    seen = model.seen[0]
+    assert isinstance(seen[0], SystemMessage)
+    assert shape(seen[1:]) == [
+        ("HumanMessage", "add gym tomorrow"),
+        ("AIMessage", "Added 'Gym', due tomorrow."),
+        ("HumanMessage", "actually make it friday"),
+    ]
+
+
+def test_run_puts_a_user_turn_in_front_of_a_leading_check_in(ask, memory):
+    memory.log(7, "assistant", "Good morning. Due today (1):\n- Gym (2:00pm)", kind="morning")
+    model = ScriptedModel(AIMessage("Pushed 'Gym' to tomorrow."))
+
+    ask(model, "push it to tomorrow")
+
+    seen = shape(model.seen[0][1:])
+    assert seen[0] == ("HumanMessage", agent.CHECK_IN_MARKER), (
+        "the first message must be the user's"
+    )
+    assert seen[1][0] == "AIMessage" and seen[1][1].startswith("Good morning")
+    assert seen[2] == ("HumanMessage", "push it to tomorrow")
+
+
+def test_run_keeps_conversations_apart_by_chat(ask, memory):
+    memory.log(8, "user", "someone else's message")
+    model = ScriptedModel(AIMessage("hi"))
+
+    ask(model, "hello", chat_id=7)
+
+    assert shape(model.seen[0][1:]) == [("HumanMessage", "hello")]
+
+
+def test_run_logs_the_exchange_and_learns_from_the_tool_event(ask, memory, todoist_api):
+    todoist_api()
+    model = ScriptedModel(
+        tool_call("create_task", {"content": "Gym", "due_string": "tomorrow at 3pm"}),
+        AIMessage("Added 'Gym', due tomorrow at 3pm."),
+    )
+
+    ask(model, "add gym tomorrow at 3pm")
+
+    assert [(row["role"], row["kind"]) for row in log_rows(memory)] == [
+        ("user", "message"),
+        ("tool", "create_task"),
+        ("assistant", "reply"),
+    ]
+    assert memory.recent(7) == [
+        ("user", "add gym tomorrow at 3pm"),
+        ("assistant", "Added 'Gym', due tomorrow at 3pm."),
+    ]
+    gym = memory.patterns()[0]
+    assert (gym.topic, gym.created) == ("gym", 1)
+
+
+def test_run_logs_a_tool_call_with_its_arguments_and_outcome(ask, memory, todoist_api):
+    todoist_api(tasks=[])
+    model = ScriptedModel(tool_call("complete_task", {"task": "x"}), AIMessage("Nothing to do."))
+
+    ask(model, "mark x done")
+
+    row = log_rows(memory)[1]
+    assert row["kind"] == "complete_task"
+    assert row["text"].startswith("There are no open tasks")
+    assert "Observer:" in row["text"], "the log keeps the tool result as the model saw it"
+    assert row["detail"] == {"args": {"task": "x"}, "outcome": "clarify"}
+
+
+def test_run_learns_from_a_half_success_but_not_from_its_repair(ask, memory, todoist_api):
+    """A task created with a dropped due date is still a task created -- and the
+    repair that gives it a date is not a reschedule."""
+    todoist_api()
+    model = ScriptedModel(
+        tool_call("create_task", {"content": "Gym", "due_string": "soonish"}),
+        tool_call("update_task", {"task": "900", "due_string": "tomorrow at 3pm"}, "call-2"),
+        AIMessage("Added 'Gym', due tomorrow at 3pm."),
+    )
+
+    ask(model, "add gym soonish")
+
+    gym = memory.patterns()[0]
+    assert (gym.created, gym.rescheduled) == (1, 0)
+
+
+def test_run_puts_the_relevant_habits_in_the_system_prompt(ask, memory):
+    for _ in range(3):
+        memory.learn({"kind": "created", "task": {"id": "1", "content": "Gym"}})
+    model = ScriptedModel(AIMessage("ok"))
+
+    ask(model, "add gym tomorrow")
+
+    prompt = model.seen[0][0].content
+    assert "'Gym': added 3 times (recurring)" in prompt
+    assert "Never nag" in prompt
+
+
+def test_run_leaves_the_prompt_alone_when_nothing_is_known(ask, memory):
+    model = ScriptedModel(AIMessage("ok"))
+
+    ask(model, "add gym tomorrow")
+
+    assert "habits" not in model.seen[0][0].content
+
+
+def test_run_looks_for_habits_in_the_earlier_messages_too(ask, memory):
+    for _ in range(3):
+        memory.learn({"kind": "created", "task": {"id": "1", "content": "Gym"}})
+    memory.log(7, "user", "add gym tomorrow")
+    memory.log(7, "assistant", "Added.", kind="reply")
+    model = ScriptedModel(AIMessage("ok"))
+
+    ask(model, "actually make it friday")
+
+    assert "'Gym'" in model.seen[0][0].content
+
+
+def test_run_logs_the_stuck_reply_too(ask, memory, todoist_api):
+    todoist_api()
+    model = ScriptedModel(
+        *[tool_call("list_tasks", {}, f"call-{i}") for i in range(config.MAX_TOOL_LOOPS + 5)]
+    )
+
+    reply = ask(model, "loop forever")
+
+    assert memory.recent(7)[-1] == ("assistant", reply)
+
+
+def test_history_conversion():
+    assert agent._history([]) == []
+    assert agent._history([("user", "a"), ("assistant", "b")]) == [
+        HumanMessage("a"),
+        AIMessage("b"),
+    ]
+    assert agent._history([("assistant", "b")]) == [
+        HumanMessage(agent.CHECK_IN_MARKER),
+        AIMessage("b"),
+    ]

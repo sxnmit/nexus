@@ -12,11 +12,15 @@ Three nodes, one conditional edge, and a back-edge:
                      the observe step set: the tool-bound one for acting, a
                      tool-less one when the verdict was "ask the user" -- so a
                      clarifying question cannot turn into a guessed tool call.
+                     Its system prompt carries the habits memory found relevant
+                     to this message, so the plan can account for them.
 
 `tools`   (act)      Runs every requested tool and appends one ToolMessage per
                      call. It decides nothing; it records what happened --
                      success, or which *kind* of failure -- in the message's
-                     `artifact`, a side channel the model never sees.
+                     `artifact`, a side channel the model never sees. The
+                     artifact also carries the tool's event (the task as
+                     Todoist returned it), for memory.
 
 `observe` (replan)   Reads those artifacts and turns each into a verdict using a
                      fixed table (`classify`): done, retry, ask, or fail. It
@@ -31,10 +35,12 @@ The split is deliberate. The *policy* -- retry, or ask, or give up -- is code:
 in one place, unit-tested, explainable. Claude only decides *how*: what the
 corrected call is, how to phrase the question, how to report the failure.
 
-There is no memory here on purpose (yet). Every Telegram message starts a fresh
-conversation, which also means a clarifying question and its answer are two
-separate runs: the answer has to stand on its own ("the iTrade one", not "the
-first one").
+Memory sits *around* the graph, in `run()`, not inside it. Before a run, the
+last few messages of the chat become the conversation so far and the relevant
+habits become a note in the prompt; after it, the exchange is logged and the
+tool events are learned from. The graph itself is pure: given the same
+messages it does the same thing, which is what keeps it testable without a
+database and keeps every read and write of memory in one place.
 """
 
 import time
@@ -43,15 +49,20 @@ from datetime import datetime
 from typing import Literal
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, START, MessagesState, StateGraph
 from pydantic import ValidationError
 
 import config
 import todoist
+from memory import Memory
 from tools import TOOLS, NeedsClarification, UnexpectedResult
 
 _TOOLS_BY_NAME = {tool.name: tool for tool in TOOLS}
+
+# Claude requires the first message to be the user's. A conversation window can
+# begin with a check-in Nexus sent on its own; this stands in for the clock.
+CHECK_IN_MARKER = "[scheduled check-in]"
 
 SYSTEM_PROMPT = """You are Nexus, the user's personal task assistant. You manage \
 their Todoist.
@@ -62,8 +73,8 @@ listing tasks.
 
 Right now it is {now}.
 
-You have five tools: create_task, list_tasks, complete_task, update_task, \
-delete_task.
+You have six tools: create_task, list_tasks, complete_task, update_task, \
+delete_task, set_reminder.
 
 Rules:
 - Use a tool whenever the user asks about or wants to change their tasks. Never \
@@ -72,15 +83,23 @@ invent a task name, id, or due date -- take them from what the tools return.
 the thing", "move that one"), ask one short clarifying question instead of \
 guessing. Never \
 create a task whose content is a placeholder.
+- The messages before the latest one are the recent conversation, including \
+check-ins you sent on a schedule (a "{marker}" line stands for the clock that \
+sent one). "It" and "that one" usually refer to something in them.
 - Pass due dates in the user's own words ("tomorrow at 3pm", "next friday"). \
 Todoist parses them; do not convert them to a date yourself.
+- "Remind me to X tomorrow at 3pm" is a task: create_task with that due date. \
+set_reminder is for an extra notification on a task that already exists -- \
+"remind me 30 minutes before the PR review" (before="30 minutes") or "ping me \
+about the PR review at 9am" (at="9am"). Todoist sends the notification, not you. \
+A "before" reminder needs a task with a due time.
 - Priorities use Todoist's p-scale: p1 is the most urgent, p4 is normal.
 - A tool result may end with a line starting "Observer:". That is the loop's \
 verdict on the call -- follow it. It says either to retry with a specific \
 correction, or to ask the user, or that nothing more can be done.
 - Never tell the user something worked when the tool said it did not. After a \
 tool succeeds, confirm what actually happened using the values it returned, \
-e.g. "Added 'Submit iTrade PR review', due Tue 9 Sep 3:00pm".{mode_note}"""
+e.g. "Added 'Submit iTrade PR review', due Tue 9 Sep 3:00pm".{memory}{mode_note}"""
 
 MODE_NOTES = {
     "act": "",
@@ -101,16 +120,20 @@ MODE_NOTES = {
 class AgentState(MessagesState):
     """MessagesState gives us `messages` with append-on-update semantics.
 
-    `steps`   how many times we have been through the agent node this run;
-              `_route` uses it as the loop's safety valve.
-    `retries` how many retries the observe step has granted this run.
-    `mode`    what the *next* agent turn is for -- "act" (tools bound), "retry"
-              (tools bound, follow the repair note) or "respond" (no tools).
+    `steps`       how many times we have been through the agent node this run;
+                  `_route` uses it as the loop's safety valve.
+    `retries`     how many retries the observe step has granted this run.
+    `mode`        what the *next* agent turn is for -- "act" (tools bound),
+                  "retry" (tools bound, follow the repair note) or "respond"
+                  (no tools).
+    `memory_note` the habits relevant to this message, already rendered for
+                  the system prompt; empty when memory has nothing to say.
     """
 
     steps: int
     retries: int
     mode: str
+    memory_note: str
 
 
 # --- The replan table ---------------------------------------------------------
@@ -194,12 +217,15 @@ def classify(artifact: dict, retries_used: int) -> Verdict:
 # --- Nodes --------------------------------------------------------------------
 
 
-def _system_prompt(mode: str = "act") -> str:
+def _system_prompt(mode: str = "act", memory_note: str = "") -> str:
     # Rebuilt per call so the model always knows today's date -- it needs that to
     # sanity-check and echo back due dates like "tomorrow at 3pm".
     now = datetime.now(config.TIMEZONE)
     return SYSTEM_PROMPT.format(
-        now=now.strftime("%A %d %B %Y, %H:%M %Z"), mode_note=MODE_NOTES.get(mode, "")
+        now=now.strftime("%A %d %B %Y, %H:%M %Z"),
+        marker=CHECK_IN_MARKER,
+        memory=memory_note,
+        mode_note=MODE_NOTES.get(mode, ""),
     )
 
 
@@ -214,7 +240,8 @@ def _agent_node(state: AgentState, acting, responding) -> dict:
     model = responding if mode == "respond" else acting
     # The system prompt is prepended rather than stored in state, so it is not
     # duplicated every time we come back round the loop.
-    reply = model.invoke([SystemMessage(_system_prompt(mode))] + state["messages"])
+    prompt = SystemMessage(_system_prompt(mode, state.get("memory_note", "")))
+    reply = model.invoke([prompt] + state["messages"])
     return {"messages": [reply], "steps": state.get("steps", 0) + 1, "mode": "act"}
 
 
@@ -223,8 +250,9 @@ def _tool_node(state: AgentState) -> dict:
 
     Nothing in here raises and nothing in here decides. Each ToolMessage carries
     the human-readable result for the model *and* an `artifact` -- a structured
-    record of the outcome kind that the model never sees. The observe node
-    turns the artifact into a verdict.
+    record of the outcome kind, plus the tool's event, that the model never
+    sees. The observe node turns the outcome into a verdict; `run()` hands the
+    event to memory.
     """
     observations = []
 
@@ -236,12 +264,16 @@ def _tool_node(state: AgentState) -> dict:
             content, artifact = f"There is no tool called '{call['name']}'.", {"outcome": "crash"}
         else:
             try:
-                content, status = str(tool.invoke(call["args"])), "success"
-                artifact = {"outcome": "ok"}
+                # Invoked with the whole tool call, a tool answers with a
+                # ToolMessage: the text for the model, and the event as artifact.
+                result = tool.invoke(call)
+                content, status = result.content, "success"
+                artifact = {"outcome": "ok", "event": result.artifact}
             except NeedsClarification as exc:
                 content, artifact = str(exc), {"outcome": "clarify"}
             except UnexpectedResult as exc:
-                content, artifact = str(exc), {"outcome": "unexpected", "repair": exc.repair}
+                content = str(exc)
+                artifact = {"outcome": "unexpected", "repair": exc.repair, "event": exc.event}
             except ValidationError as exc:
                 content, artifact = f"Invalid arguments: {exc}", {"outcome": "bad_args"}
             except todoist.TodoistError as exc:
@@ -348,7 +380,7 @@ def _build_llm() -> ChatAnthropic:
 
 
 def _build_model():
-    """Claude with the five tools bound, so it can emit tool calls."""
+    """Claude with the six tools bound, so it can emit tool calls."""
     return _build_llm().bind_tools(TOOLS)
 
 
@@ -383,18 +415,68 @@ def build_graph(model=None):
     return graph.compile()
 
 
-def run(graph, user_text: str) -> str:
-    """Run one Telegram message through the graph and return the reply text."""
-    final = graph.invoke(
-        {"messages": [HumanMessage(user_text)], "steps": 0, "retries": 0, "mode": "act"}
-    )
-    reply = final["messages"][-1].text.strip()
+# --- One message, end to end --------------------------------------------------
 
+
+def _history(rows: list[tuple[str, str]]) -> list[BaseMessage]:
+    """The recent log as messages, with a user turn in front if the window
+    happens to open on a check-in Nexus sent by itself."""
+    messages: list[BaseMessage] = [
+        HumanMessage(text) if role == "user" else AIMessage(text) for role, text in rows
+    ]
+    if messages and isinstance(messages[0], AIMessage):
+        messages.insert(0, HumanMessage(CHECK_IN_MARKER))
+    return messages
+
+
+def _remember(memory: Memory, chat_id: int, new_messages: list[BaseMessage]) -> None:
+    """Log what the run did and learn from it: one row per tool call, and the
+    event behind each successful (or half-successful) one."""
+    args_by_call = {}
+    for message in new_messages:
+        if isinstance(message, AIMessage):
+            for call in message.tool_calls:
+                args_by_call[call["id"]] = call["args"]
+        elif isinstance(message, ToolMessage):
+            artifact = message.artifact or {}
+            memory.log(
+                chat_id,
+                "tool",
+                message.content,
+                kind=message.name,
+                detail={
+                    "args": args_by_call.get(message.tool_call_id, {}),
+                    "outcome": artifact.get("outcome"),
+                },
+            )
+            memory.learn(artifact.get("event"))
+
+
+def run(graph, user_text: str, memory: Memory, chat_id: int = 0) -> str:
+    """Run one Telegram message through the graph and return the reply text."""
+    rows = memory.recent(chat_id)
+    history = _history(rows)
+    note = memory.note([user_text, *(text for role, text in rows if role == "user")])
+    memory.log(chat_id, "user", user_text)
+
+    final = graph.invoke(
+        {
+            "messages": [*history, HumanMessage(user_text)],
+            "steps": 0,
+            "retries": 0,
+            "mode": "act",
+            "memory_note": note,
+        }
+    )
+    _remember(memory, chat_id, final["messages"][len(history) + 1 :])
+
+    reply = final["messages"][-1].text.strip()
     if not reply:
         # We left the loop still wanting to call tools, i.e. we hit MAX_TOOL_LOOPS.
-        return (
+        reply = (
             "I got stuck on that one - I kept trying tools without getting to an "
             "answer. Could you rephrase it?"
         )
 
+    memory.log(chat_id, "assistant", reply, kind="reply")
     return reply

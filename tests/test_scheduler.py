@@ -6,6 +6,7 @@ fake. The jobs are coroutines, run with asyncio.run().
 """
 
 import asyncio
+import logging
 from datetime import date, datetime, time, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -15,6 +16,8 @@ import pytest
 
 import config
 import scheduler
+import todoist
+from memory import Memory
 from scheduler import Proactive, Window
 
 TZ = ZoneInfo("America/Toronto")
@@ -46,14 +49,18 @@ def at(hour, minute=0, day=9):
     return datetime(2026, 9, day, hour, minute, tzinfo=TZ)
 
 
-def make(chat_id=42, quiet=("22:00", "07:00"), now=None):
-    """A Proactive with a fake clock you can move: `clock['now'] = at(15, 30)`."""
+def make(chat_id=42, quiet=("22:00", "07:00"), now=None, memory=None):
+    """A Proactive with a fake clock you can move: `clock['now'] = at(15, 30)`.
+
+    Pass `memory` from an earlier Proactive to play a restart: a new process
+    around the same database."""
     clock = {"now": now or at(8)}
     outbox = Outbox()
     proactive = Proactive(
         send=outbox,
         chat_id=chat_id,
         quiet=Window(time.fromisoformat(quiet[0]), time.fromisoformat(quiet[1])),
+        memory=memory or Memory(":memory:", clock=lambda: clock["now"]),
         clock=lambda: clock["now"],
     )
     return proactive, outbox, clock
@@ -122,27 +129,33 @@ def test_a_zero_length_window_means_no_quiet_hours():
 
 
 def test_parse_due_date_only():
-    assert scheduler._parse_due(dated("1", "x", day=9)) == (TODAY, None)
+    assert todoist.parse_due(dated("1", "x", day=9)) == (TODAY, None)
 
 
 def test_parse_due_floating_local_time():
-    day, when = scheduler._parse_due(timed("1", "x", 15))
+    day, when = todoist.parse_due(timed("1", "x", 15))
     assert (day, when) == (TODAY, at(15))
 
 
 def test_parse_due_converts_utc_timestamps_to_the_configured_zone():
-    day, when = scheduler._parse_due(timed("1", "x", 15, utc=True))
+    day, when = todoist.parse_due(timed("1", "x", 15, utc=True))
     assert when == at(15) and when.tzinfo is TZ and day == TODAY
 
 
 def test_parse_due_accepts_a_timestamp_in_the_date_field():
     task = {"id": "1", "due": {"date": "2026-09-09T15:00:00"}}
-    assert scheduler._parse_due(task) == (TODAY, at(15))
+    assert todoist.parse_due(task) == (TODAY, at(15))
 
 
 def test_parse_due_without_a_due_date():
-    assert scheduler._parse_due({"id": "1", "content": "x"}) == (None, None)
-    assert scheduler._parse_due({"id": "1", "due": None}) == (None, None)
+    assert todoist.parse_due({"id": "1", "content": "x"}) == (None, None)
+    assert todoist.parse_due({"id": "1", "due": None}) == (None, None)
+
+
+def test_due_key_is_the_due_date_exactly_as_todoist_states_it():
+    assert todoist.due_key(timed("1", "x", 15)) == "2026-09-09T15:00:00"
+    assert todoist.due_key(dated("1", "x", day=9)) == "2026-09-09"
+    assert todoist.due_key({"id": "1", "content": "x"}) == ""
 
 
 def test_split_today_overdue_future_undated():
@@ -287,7 +300,7 @@ def test_morning_checkin_reports_and_snapshots(todoist_api):
     assert "Later" not in text
     assert set(proactive.snapshot) == {"1", "2"}
     assert proactive.snapshot_at == at(8)
-    assert proactive.nudged == {"1", "2"}, "reported now, so the nudge job must not repeat them"
+    assert set(proactive.reported) == {"1", "2"}, "reported now; the nudge job must not repeat them"
 
 
 def test_morning_checkin_always_sends_even_with_nothing_due(todoist_api):
@@ -384,7 +397,7 @@ def test_evening_review_marks_still_open_tasks_as_reported(todoist_api):
 
     run(proactive.evening_review())
 
-    assert proactive.nudged == {"1"}
+    assert set(proactive.reported) == {"1"}
 
 
 def test_evening_review_is_honest_when_todoist_is_down(todoist_api):
@@ -403,16 +416,18 @@ def test_nudge_reports_a_timed_task_that_just_went_overdue_once(todoist_api):
     todoist_api(tasks=[timed("1", "Submit PR", 15)])
     proactive, outbox, clock = make(now=at(15, 20))
 
-    run(proactive.overdue_nudge())
-    run(proactive.overdue_nudge())
+    first = run(proactive.overdue_nudge())
+    second = run(proactive.overdue_nudge())
     clock["now"] = at(18)
     run(proactive.overdue_nudge())
 
     assert outbox.texts == ["Overdue: 'Submit PR' was due 3:00pm (20 min ago). Done, or push it?"]
-    assert proactive.nudged == {"1"}
+    assert set(proactive.reported) == {"1"}
+    assert first == "nudged about 1 task(s)"
+    assert second == "nothing newly overdue (1 open tasks, 1 with a time, 1 already reported)"
 
 
-def test_nudge_ignores_date_only_future_and_ancient_tasks(todoist_api):
+def test_nudge_ignores_date_only_future_and_ancient_tasks(todoist_api, caplog):
     todoist_api(
         tasks=[
             dated("date-only", "Overdue by date", day=8),
@@ -423,9 +438,23 @@ def test_nudge_ignores_date_only_future_and_ancient_tasks(todoist_api):
     )
     proactive, outbox, _ = make(now=at(15, 20))
 
-    run(proactive.overdue_nudge())
+    with caplog.at_level(logging.INFO, logger="nexus.proactive"):
+        run(proactive.overdue_nudge())
 
     assert outbox.sent == []
+    assert (
+        "nudge: nothing newly overdue (4 open tasks, 2 with a time, 0 already reported); "
+        "next up: 'Later today' at 6:00pm" in caplog.text
+    ), "silence must be visibly a choice in the log, and say what ends it"
+
+
+def test_nudge_names_the_next_timed_task_even_on_another_day(todoist_api):
+    todoist_api(tasks=[timed("1", "Exam", 13, day=12), timed("2", "Later", 9, day=13)])
+    proactive, _, _ = make(now=at(15, 20))
+
+    outcome = run(proactive.overdue_nudge())
+
+    assert outcome.endswith("; next up: 'Exam' at 1:00pm on Sat 12 Sep")
 
 
 def test_nudge_skips_what_the_morning_checkin_already_reported(todoist_api):
@@ -443,13 +472,14 @@ def test_nudge_held_in_quiet_hours_is_sent_when_the_window_opens(todoist_api):
     todoist_api(tasks=[timed("1", "Late night", 23, day=8)])
     proactive, outbox, clock = make(now=at(23, 30, day=8))
 
-    run(proactive.overdue_nudge())
-    assert outbox.sent == [] and proactive.nudged == set(), "held, not forgotten"
+    outcome = run(proactive.overdue_nudge())
+    assert outbox.sent == [] and proactive.reported == {}, "held, not forgotten"
+    assert outcome == "held by quiet hours: 1 task(s) waiting"
 
     clock["now"] = at(7, 5, day=9)
     run(proactive.overdue_nudge())
 
-    assert len(outbox.sent) == 1 and proactive.nudged == {"1"}
+    assert len(outbox.sent) == 1 and set(proactive.reported) == {"1"}
 
 
 def test_nudge_batches_several_in_time_order(todoist_api):
@@ -465,9 +495,18 @@ def test_nudge_only_logs_when_todoist_is_down(todoist_api):
     todoist_api(fail="HTTP 503 - down", fail_status=503)
     proactive, outbox, _ = make(now=at(15))
 
-    run(proactive.overdue_nudge())
+    outcome = run(proactive.overdue_nudge())
 
     assert outbox.sent == [], "a message every 15 minutes about an outage would be nagging"
+    assert outcome == "Todoist unavailable (HTTP 503 - down)"
+
+
+def test_nudge_says_when_there_is_no_recipient(todoist_api):
+    todoist_api(tasks=[timed("1", "Submit PR", 15)])
+    proactive, outbox, _ = make(chat_id=None, now=at(15, 20))
+
+    assert run(proactive.overdue_nudge()) == "not sent: no TELEGRAM_CHAT_ID"
+    assert outbox.sent == []
 
 
 # --- Wiring ---------------------------------------------------------------------------
@@ -488,6 +527,18 @@ def test_schedule_jobs_registers_three_jobs_in_the_configured_zone(monkeypatch):
     assert repeating["interval"] == timedelta(minutes=15) and repeating["name"] == "overdue"
 
 
+def test_schedule_jobs_lets_a_missed_run_still_happen():
+    """A laptop asleep at 08:00 still gets its check-in when it wakes within the hour."""
+    queue = SimpleNamespace(run_daily=Mock(), run_repeating=Mock())
+    proactive, _, _ = make()
+
+    scheduler.schedule_jobs(SimpleNamespace(job_queue=queue), proactive)
+
+    for call in queue.run_daily.call_args_list:
+        assert call.kwargs["job_kwargs"] == {"misfire_grace_time": 3600}
+    assert queue.run_repeating.call_args.kwargs["job_kwargs"] == {"misfire_grace_time": 300}
+
+
 def test_scheduled_callbacks_run_the_jobs():
     queue = SimpleNamespace(run_daily=Mock(), run_repeating=Mock())
     proactive, _, _ = make()
@@ -505,6 +556,138 @@ def test_scheduled_callbacks_run_the_jobs():
 
 
 def test_now_uses_the_real_clock_in_the_configured_zone_by_default():
-    proactive = Proactive(send=Outbox(), chat_id=1, quiet=Window(time(22, 0), time(7, 0)))
+    proactive = Proactive(
+        send=Outbox(), chat_id=1, quiet=Window(time(22, 0), time(7, 0)), memory=Memory()
+    )
     assert proactive.now().tzinfo is TZ
     assert abs(proactive.now() - datetime.now(TZ)) < timedelta(seconds=5)
+
+
+# --- Memory around the jobs -----------------------------------------------------------
+
+
+def test_deliver_logs_what_it_sent_as_part_of_the_conversation():
+    proactive, _, _ = make()
+
+    run(proactive.deliver("morning", "Good morning."))
+
+    assert proactive.memory.recent(42) == [("assistant", "Good morning.")]
+
+
+def test_deliver_logs_nothing_it_did_not_send():
+    proactive, _, _ = make(now=at(23))
+
+    run(proactive.deliver("nudge", "hello"))
+
+    assert proactive.memory.recent(42) == []
+
+
+def slipping(memory, content="Gym"):
+    """Teach memory that `content` has been pushed later twice."""
+    for before, after in (("2026-09-07", "2026-09-08"), ("2026-09-08", "2026-09-09")):
+        memory.learn(
+            {
+                "kind": "updated",
+                "before": {"id": "1", "content": content, "due": {"date": before}},
+                "after": {"id": "1", "content": content, "due": {"date": after}},
+            }
+        )
+
+
+GYM_ADVICE = (
+    "'Gym' keeps slipping (moved twice before, always later). Drop it, or give it a fixed slot?"
+)
+
+
+def test_morning_checkin_adds_advice_for_a_task_that_keeps_slipping(todoist_api):
+    todoist_api(tasks=[timed("1", "Gym", 14), dated("2", "Read", day=9)])
+    proactive, outbox, _ = make()
+    slipping(proactive.memory)
+
+    run(proactive.morning_checkin())
+
+    text = outbox.texts[0]
+    assert text.endswith("Want to move or reprioritise anything? Say which.\n\n" + GYM_ADVICE)
+    assert text.count("Gym") == 2, "listed once, advised once"
+
+
+def test_evening_review_adds_advice_for_what_is_still_open(todoist_api):
+    todoist_api(tasks=[timed("1", "Gym", 14)])
+    proactive, outbox, clock = make(now=at(14))
+    slipping(proactive.memory)
+    clock["now"] = at(21)
+
+    run(proactive.evening_review())
+
+    assert outbox.texts[0].endswith("Push any of these to tomorrow? Say which.\n\n" + GYM_ADVICE)
+
+
+def test_nudge_adds_advice(todoist_api):
+    todoist_api(tasks=[timed("1", "Gym", 14)])
+    proactive, outbox, _ = make(now=at(14, 20))
+    slipping(proactive.memory)
+
+    run(proactive.overdue_nudge())
+
+    assert outbox.texts == [
+        "Overdue: 'Gym' was due 2:00pm (20 min ago). Done, or push it?\n\n" + GYM_ADVICE
+    ]
+
+
+def test_with_advice_is_a_no_op_without_advice():
+    assert scheduler.with_advice("report", []) == "report"
+    assert scheduler.with_advice("report", ["a", "b"]) == "report\n\na\nb"
+
+
+def test_a_restart_keeps_the_morning_snapshot(todoist_api):
+    todo = todoist_api(tasks=[timed("1", "Submit PR", 15), dated("2", "Read", day=9)])
+    first, _, _ = make()
+    run(first.morning_checkin())
+
+    todo.tasks = [task for task in todo.tasks if task["id"] != "1"]  # done during the day
+    second, outbox, _ = make(now=at(21), memory=first.memory)  # the process restarted
+
+    assert set(second.snapshot) == {"1", "2"} and second.snapshot_at == at(8)
+    run(second.evening_review())
+    text = outbox.texts[0]
+    assert "Done today (1):\n- Submit PR" in text
+    assert "I started at" not in text
+
+
+def test_a_restart_keeps_what_was_reported(todoist_api):
+    todoist_api(tasks=[timed("1", "Submit PR", 15)])
+    first, outbox, _ = make(now=at(15, 20))
+    run(first.overdue_nudge())
+    assert len(outbox.sent) == 1
+
+    second, outbox, _ = make(now=at(15, 40), memory=first.memory)
+    run(second.overdue_nudge())
+
+    assert outbox.sent == [], "nudged before the restart; not again after it"
+
+
+def test_a_task_pushed_to_a_new_time_is_nudged_again(todoist_api):
+    todo = todoist_api(tasks=[timed("1", "Submit PR", 15)])
+    proactive, outbox, clock = make(now=at(15, 20))
+    run(proactive.overdue_nudge())
+
+    todo.tasks[0]["due"] = timed("1", "Submit PR", 17)["due"]  # the user moved it to 5pm
+    clock["now"] = at(17, 10)
+    run(proactive.overdue_nudge())
+
+    assert len(outbox.sent) == 2
+    assert "was due 5:00pm" in outbox.texts[1]
+
+
+def test_morning_checkin_forgets_reported_tasks_that_are_no_longer_open(todoist_api):
+    todo = todoist_api(tasks=[timed("1", "Submit PR", 7), timed("2", "Gone", 7)])
+    proactive, _, clock = make()
+    run(proactive.morning_checkin())
+    assert set(proactive.reported) == {"1", "2"}
+
+    todo.tasks = [task for task in todo.tasks if task["id"] != "2"]
+    clock["now"] = at(8, day=10)
+    run(proactive.morning_checkin())
+
+    assert proactive.reported == {"1": "2026-09-09T07:00:00"}
+    assert proactive.memory.load("reported") == proactive.reported

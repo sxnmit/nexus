@@ -24,11 +24,17 @@ def make_update(text="hello", user_id=42, chat_id=7, has_user=True):
     )
 
 
-def make_context(graph="the-graph"):
+def make_context(graph="the-graph", memory="the-memory", proactive=None):
     return SimpleNamespace(
         bot=SimpleNamespace(send_chat_action=AsyncMock()),
-        bot_data={"graph": graph},
+        bot_data={"graph": graph, "memory": memory, "proactive": proactive},
     )
+
+
+@pytest.fixture(autouse=True)
+def in_ram_database(monkeypatch):
+    """main() opens the memory database first thing; never a real file in tests."""
+    monkeypatch.setattr(config, "DB_PATH", ":memory:")
 
 
 @pytest.fixture
@@ -64,12 +70,12 @@ def test_updates_without_a_sender_are_rejected_when_locked(locked_bot):
 
 def test_on_message_runs_the_agent_and_replies(open_bot, monkeypatch):
     calls = []
-    monkeypatch.setattr(bot, "run", lambda graph, text: calls.append((graph, text)) or "Added it.")
+    monkeypatch.setattr(bot, "run", lambda *args: calls.append(args) or "Added it.")
     update, context = make_update("add milk"), make_context()
 
     asyncio.run(bot.on_message(update, context))
 
-    assert calls == [("the-graph", "add milk")]
+    assert calls == [("the-graph", "add milk", "the-memory", 7)], "graph, text, memory, chat id"
     context.bot.send_chat_action.assert_awaited_once()
     assert context.bot.send_chat_action.await_args.kwargs["chat_id"] == 7
     update.message.reply_text.assert_awaited_once_with("Added it.")
@@ -77,7 +83,7 @@ def test_on_message_runs_the_agent_and_replies(open_bot, monkeypatch):
 
 def test_on_message_strips_the_text_before_running_the_agent(open_bot, monkeypatch):
     seen = []
-    monkeypatch.setattr(bot, "run", lambda graph, text: seen.append(text) or "ok")
+    monkeypatch.setattr(bot, "run", lambda graph, text, memory, chat_id: seen.append(text) or "ok")
 
     asyncio.run(bot.on_message(make_update("  add milk \n"), make_context()))
 
@@ -106,7 +112,7 @@ def test_on_message_silently_drops_unauthorised_users(locked_bot, monkeypatch):
 
 
 def test_on_message_still_serves_authorised_users_when_locked(locked_bot, monkeypatch):
-    monkeypatch.setattr(bot, "run", lambda graph, text: "ok")
+    monkeypatch.setattr(bot, "run", lambda graph, text, memory, chat_id: "ok")
     update = make_update(user_id=42)
 
     asyncio.run(bot.on_message(update, make_context()))
@@ -115,7 +121,7 @@ def test_on_message_still_serves_authorised_users_when_locked(locked_bot, monkey
 
 
 def test_on_message_replies_with_a_fallback_when_the_agent_crashes(open_bot, monkeypatch):
-    def boom(graph, text):
+    def boom(graph, text, memory, chat_id):
         raise RuntimeError("api down")
 
     monkeypatch.setattr(bot, "run", boom)
@@ -143,6 +149,81 @@ def test_on_start_is_silent_for_unauthorised_users(locked_bot):
     update = make_update("/start", user_id=2)
 
     asyncio.run(bot.on_start(update, make_context()))
+
+    update.message.reply_text.assert_not_awaited()
+
+
+# --- /nudge -------------------------------------------------------------------
+
+
+def test_on_nudge_runs_the_overdue_check_and_reports(open_bot):
+    proactive = SimpleNamespace(overdue_nudge=AsyncMock(return_value="nudged about 1 task(s)"))
+    update = make_update("/nudge")
+
+    asyncio.run(bot.on_nudge(update, make_context(proactive=proactive)))
+
+    proactive.overdue_nudge.assert_awaited_once()
+    update.message.reply_text.assert_awaited_once_with("Overdue check: nudged about 1 task(s).")
+
+
+def test_on_nudge_is_silent_for_unauthorised_users(locked_bot):
+    proactive = SimpleNamespace(overdue_nudge=AsyncMock())
+    update = make_update("/nudge", user_id=2)
+
+    asyncio.run(bot.on_nudge(update, make_context(proactive=proactive)))
+
+    proactive.overdue_nudge.assert_not_awaited()
+    update.message.reply_text.assert_not_awaited()
+
+
+# --- Errors -------------------------------------------------------------------
+
+
+def test_on_error_logs_network_trouble_as_one_warning_line(caplog):
+    from telegram.error import NetworkError
+
+    context = SimpleNamespace(error=NetworkError("httpx.ConnectError: nodename nor servname"))
+
+    with caplog.at_level(logging.WARNING, logger="nexus"):
+        asyncio.run(bot.on_error(None, context))
+
+    assert caplog.record_tuples == [
+        (
+            "nexus",
+            logging.WARNING,
+            "Telegram unreachable (httpx.ConnectError: nodename nor servname); retrying",
+        )
+    ]
+
+
+def test_on_error_keeps_the_traceback_for_anything_else(caplog):
+    context = SimpleNamespace(error=RuntimeError("boom"))
+
+    with caplog.at_level(logging.ERROR, logger="nexus"):
+        asyncio.run(bot.on_error(None, context))
+
+    record = caplog.records[0]
+    assert record.levelno == logging.ERROR
+    assert record.exc_info[1] is context.error, "a bug keeps its traceback"
+
+
+# --- /memory ------------------------------------------------------------------
+
+
+def test_on_memory_replies_with_the_summary(open_bot, memory):
+    memory.log(7, "user", "hi")
+    update = make_update("/memory")
+
+    asyncio.run(bot.on_memory(update, make_context(memory=memory)))
+
+    reply = update.message.reply_text.await_args.args[0]
+    assert reply.startswith("Memory: 1 interaction logged, 0 topics tracked.")
+
+
+def test_on_memory_is_silent_for_unauthorised_users(locked_bot, memory):
+    update = make_update("/memory", user_id=2)
+
+    asyncio.run(bot.on_memory(update, make_context(memory=memory)))
 
     update.message.reply_text.assert_not_awaited()
 
@@ -196,7 +277,13 @@ def boot(monkeypatch, todoist_api, chat_id):
     monkeypatch.setattr(config, "TELEGRAM_CHAT_ID", chat_id)
     todoist_api(tasks=[])
     queue = SimpleNamespace(run_daily=Mock(), run_repeating=Mock())
-    app = SimpleNamespace(bot_data={}, add_handler=Mock(), run_polling=Mock(), job_queue=queue)
+    app = SimpleNamespace(
+        bot_data={},
+        add_handler=Mock(),
+        add_error_handler=Mock(),
+        run_polling=Mock(),
+        job_queue=queue,
+    )
     builder = SimpleNamespace(token=lambda token: SimpleNamespace(build=lambda: app))
     monkeypatch.setattr(bot.Application, "builder", lambda: builder)
     monkeypatch.setattr(bot, "build_graph", lambda: "the-graph")
@@ -211,8 +298,11 @@ def test_main_wires_the_handlers_and_starts_polling(monkeypatch, todoist_api, ca
         bot.main()
 
     assert app.bot_data["graph"] == "the-graph"
+    assert isinstance(app.bot_data["memory"], bot.Memory)
     handler_types = [type(call.args[0]).__name__ for call in app.add_handler.call_args_list]
-    assert handler_types == ["CommandHandler", "MessageHandler"]
+    assert handler_types == ["CommandHandler", "CommandHandler", "CommandHandler", "MessageHandler"]
+    app.add_error_handler.assert_called_once_with(bot.on_error)
+    assert isinstance(app.bot_data["proactive"], bot.Proactive), "/nudge needs it even when off"
     app.run_polling.assert_called_once()
     assert app.job_queue.run_daily.call_count == 0, "no recipient, so no check-ins"
     assert "Proactive messages OFF" in caplog.text
@@ -226,6 +316,30 @@ def test_main_schedules_the_check_ins_when_there_is_a_recipient(monkeypatch, tod
     names = [call.kwargs["name"] for call in app.job_queue.run_daily.call_args_list]
     assert names == ["morning", "evening"]
     assert app.job_queue.run_repeating.call_args.kwargs["name"] == "overdue"
+
+
+def test_main_opens_memory_before_touching_the_network(monkeypatch, todoist_api, caplog):
+    boot(monkeypatch, todoist_api, chat_id=None)
+
+    with caplog.at_level(logging.INFO, logger="nexus"):
+        bot.main()
+
+    memory_line = next(line for line in caplog.messages if line.startswith("Memory:"))
+    assert memory_line == "Memory: :memory: (0 interactions, 0 topics)"
+    assert caplog.messages.index(memory_line) < caplog.messages.index(
+        next(line for line in caplog.messages if line.startswith("Todoist OK"))
+    )
+
+
+def test_main_exits_when_the_database_cannot_be_opened(monkeypatch, todoist_api, tmp_path):
+    boot(monkeypatch, todoist_api, chat_id=None)
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "no-such-dir" / "nexus.db"))
+
+    with pytest.raises(SystemExit) as excinfo:
+        bot.main()
+
+    assert "Could not open the memory database" in str(excinfo.value)
+    assert "NEXUS_DB_PATH" in str(excinfo.value)
 
 
 def test_main_exits_on_a_setting_it_could_not_parse(monkeypatch, todoist_api):

@@ -5,9 +5,11 @@ Polling, not webhooks -- no ngrok, no public URL, just `python bot.py`.
 
 import asyncio
 import logging
+import sqlite3
 
 from telegram import Update
 from telegram.constants import ChatAction
+from telegram.error import NetworkError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -19,6 +21,7 @@ from telegram.ext import (
 import config
 import todoist
 from agent import build_graph, check_model, run
+from memory import Memory
 from scheduler import Proactive, Window, schedule_jobs
 
 logging.basicConfig(format="%(asctime)s  %(levelname)-7s %(name)s: %(message)s", level=logging.INFO)
@@ -32,9 +35,12 @@ GREETING = (
     "  what's on my list?\n"
     "  mark the PR review done\n"
     "  move the PR review to friday 5pm\n"
+    "  remind me 30 minutes before the PR review\n"
     "  delete the milk task\n\n"
     f"I'll also check in at {config.MORNING_TIME:%H:%M} with what's due and at "
-    f"{config.EVENING_TIME:%H:%M} with what got done."
+    f"{config.EVENING_TIME:%H:%M} with what got done. "
+    "Send /memory to see what I've learned about your habits, and /nudge to run the "
+    "overdue check right now."
 )
 
 
@@ -51,6 +57,20 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(GREETING)
 
 
+async def on_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A window into memory: how much is logged, and which habits stand out."""
+    if _is_allowed(update):
+        await update.message.reply_text(context.bot_data["memory"].summary())
+
+
+async def on_nudge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run the overdue check now and say what it saw -- so the job can be
+    tested without waiting for its next tick or reading the log."""
+    if _is_allowed(update):
+        outcome = await context.bot_data["proactive"].overdue_nudge()
+        await update.message.reply_text(f"Overdue check: {outcome}.")
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
     if not text:
@@ -62,18 +82,31 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     log.info("<- %s", text)
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     try:
         # The graph and the Todoist calls inside it are synchronous, so run them
         # on a worker thread instead of blocking the polling loop.
-        reply = await asyncio.to_thread(run, context.bot_data["graph"], text)
+        reply = await asyncio.to_thread(
+            run, context.bot_data["graph"], text, context.bot_data["memory"], chat_id
+        )
     except Exception:
         log.exception("Agent run failed")
         reply = "Something broke on my side and I couldn't finish that. Check the bot logs."
 
     log.info("-> %s", reply)
     await update.message.reply_text(reply)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """python-telegram-bot retries network trouble by itself -- a laptop going
+    to sleep, Wi-Fi dropping -- so one line is enough for the log. Anything
+    else is a bug and gets its traceback."""
+    if isinstance(context.error, NetworkError):
+        log.warning("Telegram unreachable (%s); retrying", context.error)
+    else:
+        log.error("Unhandled error in the bot", exc_info=context.error)
 
 
 def _sender(app):
@@ -99,6 +132,18 @@ def main() -> None:
         raise SystemExit(
             "Bad settings:\n  " + "\n  ".join(problems) + "\nSee .env.example for the formats."
         )
+
+    # Local things first: the database must open before it is worth asking the
+    # network anything.
+    try:
+        memory = Memory(config.DB_PATH)
+    except sqlite3.OperationalError as exc:
+        raise SystemExit(
+            f"Could not open the memory database at {config.DB_PATH}: {exc}\n"
+            "Set NEXUS_DB_PATH to a writable location (on a host, a mounted volume)."
+        ) from exc
+    interactions, topics = memory.counts()
+    log.info("Memory: %s (%d interactions, %d topics)", config.DB_PATH, interactions, topics)
 
     # Check Todoist now rather than discovering a bad token mid-conversation.
     try:
@@ -134,13 +179,21 @@ def main() -> None:
 
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
     app.bot_data["graph"] = build_graph()
+    app.bot_data["memory"] = memory
     app.add_handler(CommandHandler("start", on_start))
+    app.add_handler(CommandHandler("memory", on_memory))
+    app.add_handler(CommandHandler("nudge", on_nudge))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_error_handler(on_error)
 
     log.info("Timezone: %s", config.TIMEZONE)
     proactive = Proactive(
-        send=_sender(app), chat_id=config.TELEGRAM_CHAT_ID, quiet=Window(*config.QUIET_HOURS)
+        send=_sender(app),
+        chat_id=config.TELEGRAM_CHAT_ID,
+        quiet=Window(*config.QUIET_HOURS),
+        memory=memory,
     )
+    app.bot_data["proactive"] = proactive
     if proactive.enabled:
         schedule_jobs(app, proactive)
         log.info(

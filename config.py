@@ -135,6 +135,21 @@ TELEGRAM_CHAT_ID = _chat_id(
 )
 
 
+# --- Memory ---------------------------------------------------------------------------
+# The SQLite file holding the interaction log, the learned habits and the
+# scheduler's state. On a host, point this at a mounted volume (the Docker
+# image defaults to /data/nexus.db) or it starts empty on every deploy.
+# ":memory:" keeps it in RAM: fine for a dry run, useless for learning.
+DB_PATH = os.getenv("NEXUS_DB_PATH", "nexus.db")
+
+# How much recent conversation the agent sees: the last N user/assistant
+# messages of the chat, and only from the last H hours. Both are small on
+# purpose. Context size is not the constraint, relevance is -- yesterday's "add
+# milk" is noise in today's "push it to friday". 0 messages turns it off.
+MEMORY_MESSAGES = _setting("NEXUS_MEMORY_MESSAGES", "10", int)
+MEMORY_HOURS = _setting("NEXUS_MEMORY_HOURS", "12", float)
+
+
 def config_errors() -> list[str]:
     """Settings that could not be parsed (the default was used in their place)."""
     return list(_ERRORS)
