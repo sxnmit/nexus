@@ -434,6 +434,11 @@ nothing needs a second process.
 | Evening review   | `NEXUS_EVENING_TIME`, default 21:00               | What got done today vs what's still open                   |
 | Overdue nudge    | every `NEXUS_OVERDUE_CHECK_MINUTES`, default 15   | A timed task that just went overdue -- once                |
 
+`/nudge` runs the overdue check right now and replies with what it saw --
+"nothing newly overdue (51 open tasks, 12 with a time, 0 already reported)",
+or "nudged about 1 task(s)" -- which is also what the job logs every fifteen
+minutes. That is how to test the nudge without waiting for its next tick.
+
 ### What triggers a proactive message, and what waits for you
 
 This is the design decision worth being able to defend, so here it is as

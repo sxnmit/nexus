@@ -301,14 +301,19 @@ class Proactive:
         text = evening_text(done, still_open, today, started_at)
         await self.deliver("evening", with_advice(text, self.memory.advice_for(still_open)))
 
-    async def overdue_nudge(self) -> None:
-        """Timed tasks that just went overdue, each reported once."""
+    async def overdue_nudge(self) -> str:
+        """Timed tasks that just went overdue, each reported once.
+
+        Returns a one-line account of what it did. The job logs it; /nudge
+        replies with it, so the check can be run and read on demand.
+        """
         now = self.now()
         try:
             tasks = await self._open_tasks()
         except todoist.TodoistError as exc:
-            log.warning("nudge: Todoist unavailable (%s)", exc)  # every 15 min: log, don't message
-            return
+            outcome = f"Todoist unavailable ({exc})"
+            log.warning("nudge: %s", outcome)  # every 15 min: log, don't message
+            return outcome
 
         fresh, timed, reported = [], 0, 0
         for task in tasks:
@@ -322,13 +327,12 @@ class Proactive:
                 fresh.append((when, task))
         if not fresh:
             # Silence is the rule, but the log should say it was a choice.
-            log.info(
-                "nudge: nothing newly overdue (%d open tasks, %d with a time, %d already reported)",
-                len(tasks),
-                timed,
-                reported,
+            outcome = (
+                f"nothing newly overdue ({len(tasks)} open tasks, {timed} with a time, "
+                f"{reported} already reported)"
             )
-            return
+            log.info("nudge: %s", outcome)
+            return outcome
 
         fresh.sort(key=lambda pair: pair[0])
         overdue = [task for _, task in fresh]
@@ -337,6 +341,10 @@ class Proactive:
             # Rule 4: only what was actually sent counts as reported. Held in
             # quiet hours -> tried again next check.
             self._mark_reported(overdue)
+            return f"nudged about {len(overdue)} task(s)"
+        if not self.enabled:
+            return "not sent: no TELEGRAM_CHAT_ID"
+        return f"held by quiet hours: {len(overdue)} task(s) waiting"
 
 
 # --- Wiring into the bot -----------------------------------------------------------

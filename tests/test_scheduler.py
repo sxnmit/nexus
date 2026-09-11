@@ -416,13 +416,15 @@ def test_nudge_reports_a_timed_task_that_just_went_overdue_once(todoist_api):
     todoist_api(tasks=[timed("1", "Submit PR", 15)])
     proactive, outbox, clock = make(now=at(15, 20))
 
-    run(proactive.overdue_nudge())
-    run(proactive.overdue_nudge())
+    first = run(proactive.overdue_nudge())
+    second = run(proactive.overdue_nudge())
     clock["now"] = at(18)
     run(proactive.overdue_nudge())
 
     assert outbox.texts == ["Overdue: 'Submit PR' was due 3:00pm (20 min ago). Done, or push it?"]
     assert set(proactive.reported) == {"1"}
+    assert first == "nudged about 1 task(s)"
+    assert second == "nothing newly overdue (1 open tasks, 1 with a time, 1 already reported)"
 
 
 def test_nudge_ignores_date_only_future_and_ancient_tasks(todoist_api, caplog):
@@ -460,8 +462,9 @@ def test_nudge_held_in_quiet_hours_is_sent_when_the_window_opens(todoist_api):
     todoist_api(tasks=[timed("1", "Late night", 23, day=8)])
     proactive, outbox, clock = make(now=at(23, 30, day=8))
 
-    run(proactive.overdue_nudge())
+    outcome = run(proactive.overdue_nudge())
     assert outbox.sent == [] and proactive.reported == {}, "held, not forgotten"
+    assert outcome == "held by quiet hours: 1 task(s) waiting"
 
     clock["now"] = at(7, 5, day=9)
     run(proactive.overdue_nudge())
@@ -482,9 +485,18 @@ def test_nudge_only_logs_when_todoist_is_down(todoist_api):
     todoist_api(fail="HTTP 503 - down", fail_status=503)
     proactive, outbox, _ = make(now=at(15))
 
-    run(proactive.overdue_nudge())
+    outcome = run(proactive.overdue_nudge())
 
     assert outbox.sent == [], "a message every 15 minutes about an outage would be nagging"
+    assert outcome == "Todoist unavailable (HTTP 503 - down)"
+
+
+def test_nudge_says_when_there_is_no_recipient(todoist_api):
+    todoist_api(tasks=[timed("1", "Submit PR", 15)])
+    proactive, outbox, _ = make(chat_id=None, now=at(15, 20))
+
+    assert run(proactive.overdue_nudge()) == "not sent: no TELEGRAM_CHAT_ID"
+    assert outbox.sent == []
 
 
 # --- Wiring ---------------------------------------------------------------------------

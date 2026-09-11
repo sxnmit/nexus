@@ -24,10 +24,10 @@ def make_update(text="hello", user_id=42, chat_id=7, has_user=True):
     )
 
 
-def make_context(graph="the-graph", memory="the-memory"):
+def make_context(graph="the-graph", memory="the-memory", proactive=None):
     return SimpleNamespace(
         bot=SimpleNamespace(send_chat_action=AsyncMock()),
-        bot_data={"graph": graph, "memory": memory},
+        bot_data={"graph": graph, "memory": memory, "proactive": proactive},
     )
 
 
@@ -150,6 +150,29 @@ def test_on_start_is_silent_for_unauthorised_users(locked_bot):
 
     asyncio.run(bot.on_start(update, make_context()))
 
+    update.message.reply_text.assert_not_awaited()
+
+
+# --- /nudge -------------------------------------------------------------------
+
+
+def test_on_nudge_runs_the_overdue_check_and_reports(open_bot):
+    proactive = SimpleNamespace(overdue_nudge=AsyncMock(return_value="nudged about 1 task(s)"))
+    update = make_update("/nudge")
+
+    asyncio.run(bot.on_nudge(update, make_context(proactive=proactive)))
+
+    proactive.overdue_nudge.assert_awaited_once()
+    update.message.reply_text.assert_awaited_once_with("Overdue check: nudged about 1 task(s).")
+
+
+def test_on_nudge_is_silent_for_unauthorised_users(locked_bot):
+    proactive = SimpleNamespace(overdue_nudge=AsyncMock())
+    update = make_update("/nudge", user_id=2)
+
+    asyncio.run(bot.on_nudge(update, make_context(proactive=proactive)))
+
+    proactive.overdue_nudge.assert_not_awaited()
     update.message.reply_text.assert_not_awaited()
 
 
@@ -277,8 +300,9 @@ def test_main_wires_the_handlers_and_starts_polling(monkeypatch, todoist_api, ca
     assert app.bot_data["graph"] == "the-graph"
     assert isinstance(app.bot_data["memory"], bot.Memory)
     handler_types = [type(call.args[0]).__name__ for call in app.add_handler.call_args_list]
-    assert handler_types == ["CommandHandler", "CommandHandler", "MessageHandler"]
+    assert handler_types == ["CommandHandler", "CommandHandler", "CommandHandler", "MessageHandler"]
     app.add_error_handler.assert_called_once_with(bot.on_error)
+    assert isinstance(app.bot_data["proactive"], bot.Proactive), "/nudge needs it even when off"
     app.run_polling.assert_called_once()
     assert app.job_queue.run_daily.call_count == 0, "no recipient, so no check-ins"
     assert "Proactive messages OFF" in caplog.text

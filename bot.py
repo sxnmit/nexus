@@ -39,7 +39,8 @@ GREETING = (
     "  delete the milk task\n\n"
     f"I'll also check in at {config.MORNING_TIME:%H:%M} with what's due and at "
     f"{config.EVENING_TIME:%H:%M} with what got done. "
-    "Send /memory to see what I've learned about your habits."
+    "Send /memory to see what I've learned about your habits, and /nudge to run the "
+    "overdue check right now."
 )
 
 
@@ -60,6 +61,14 @@ async def on_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """A window into memory: how much is logged, and which habits stand out."""
     if _is_allowed(update):
         await update.message.reply_text(context.bot_data["memory"].summary())
+
+
+async def on_nudge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run the overdue check now and say what it saw -- so the job can be
+    tested without waiting for its next tick or reading the log."""
+    if _is_allowed(update):
+        outcome = await context.bot_data["proactive"].overdue_nudge()
+        await update.message.reply_text(f"Overdue check: {outcome}.")
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -173,6 +182,7 @@ def main() -> None:
     app.bot_data["memory"] = memory
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("memory", on_memory))
+    app.add_handler(CommandHandler("nudge", on_nudge))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.add_error_handler(on_error)
 
@@ -183,6 +193,7 @@ def main() -> None:
         quiet=Window(*config.QUIET_HOURS),
         memory=memory,
     )
+    app.bot_data["proactive"] = proactive
     if proactive.enabled:
         schedule_jobs(app, proactive)
         log.info(
