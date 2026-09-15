@@ -526,16 +526,16 @@ knows), memory learns from the tool's event, and the record gets a `button`
 row. The nudge is edited in place with the outcome, and the tapped task's row
 of buttons disappears while any others stay.
 
-### Why the nudge only watches timed tasks
+### When a task counts as overdue
 
-A task "due today" with no time becomes overdue at midnight -- inside quiet
-hours -- and is exactly what the 08:00 check-in reports as overdue. Nudging it
-at 07:00 and listing it again at 08:00 is the nagging rule 2 exists to prevent.
-So the nudge job only watches tasks with a clock time ("was due 3:00pm, 20 min
-ago"), and only ones that went overdue in the last 24 hours, so a restart can't
-re-nudge last week. What it has reported is saved to the memory database, per
+A task with a time is overdue from that minute ("was due 3:00pm, 20 min ago").
+A task with only a day is overdue from midnight after that day ("was due
+yesterday"): that moment falls inside quiet hours, so the first check after
+07:00 sends it. Either way the nudge only reports what went overdue in the
+last 24 hours, so a restart can't re-nudge last week; older items are the
+morning check-in's. What it has reported is saved to the memory database, per
 task *and* per due date: a restart does not repeat a nudge, and a task you push
-to a new time is a new transition, nudged again when that time passes.
+to a new day or time is a new transition, nudged again when that passes.
 
 ### Timezone
 

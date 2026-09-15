@@ -176,16 +176,35 @@ def evening_text(
     return "\n\n".join(parts)
 
 
+def overdue_at(task: dict) -> datetime | None:
+    """The moment a task becomes overdue: its time, or -- for a task with a day
+    but no time -- midnight after that day. None for an undated task."""
+    day, when = todoist.parse_due(task)
+    if when is not None:
+        return when
+    if day is not None:
+        return datetime.combine(day + timedelta(days=1), time(0, 0), tzinfo=config.TIMEZONE)
+    return None
+
+
+def _due(task: dict, now: datetime) -> str:
+    """'3:00pm' for a timed task; 'yesterday' or 'N days ago' for a day-only one."""
+    day, when = todoist.parse_due(task)
+    if when is not None:
+        return _clock(when)
+    behind = (now.date() - day).days
+    return "yesterday" if behind == 1 else f"{behind} days ago"
+
+
 def nudge_text(fresh: list[tuple[datetime, dict]], now: datetime) -> str:
     if len(fresh) == 1:
         when, task = fresh[0]
-        return (
-            f"Overdue: '{task.get('content')}' was due {_clock(when)} "
-            f"({_ago(now - when)} ago). Done, or push it?"
-        )
+        _, timed = todoist.parse_due(task)
+        ago = f" ({_ago(now - when)} ago)" if timed is not None else ""
+        return f"Overdue: '{task.get('content')}' was due {_due(task, now)}{ago}. Done, or push it?"
     lines = [
-        f"{index}. {task.get('content')} (due {_clock(when)})"
-        for index, (when, task) in enumerate(fresh, start=1)
+        f"{index}. {task.get('content')} (due {_due(task, now)})"
+        for index, (_, task) in enumerate(fresh, start=1)
     ]
     return f"Overdue ({len(fresh)}):\n" + "\n".join(lines) + "\n\nDone, or push them?"
 
@@ -359,7 +378,8 @@ class Proactive:
         self._record(begun, "evening", "clock", self.delivery(sent), text)
 
     async def overdue_nudge(self, trigger: str = "clock") -> str:
-        """Timed tasks that just went overdue, each reported once.
+        """Tasks that just went overdue, each reported once: a timed task at
+        its time, a day-only task at midnight after its day.
 
         Returns a one-line account of what it did. The job logs it; /nudge
         replies with it, so the check can be run and read on demand. `trigger`
@@ -375,12 +395,12 @@ class Proactive:
             self._record(begun, "overdue", trigger, "unavailable", "", note=str(exc))
             return outcome
 
-        fresh, timed, reported, upcoming = [], 0, 0, None
+        fresh, dated, reported, upcoming = [], 0, 0, None
         for task in tasks:
-            _, when = todoist.parse_due(task)
+            when = overdue_at(task)
             if when is None:
-                continue  # day-only tasks are the morning check-in's job
-            timed += 1
+                continue  # undated: nothing to be overdue against
+            dated += 1
             if self._is_reported(task):
                 reported += 1
             elif when <= now <= when + NUDGE_LOOKBACK:
@@ -391,7 +411,7 @@ class Proactive:
             # Silence is the rule, but the log should say it was a choice --
             # and name the next task that will end it.
             outcome = (
-                f"nothing newly overdue ({len(tasks)} open tasks, {timed} with a time, "
+                f"nothing newly overdue ({len(tasks)} open tasks, {dated} dated, "
                 f"{reported} already reported)"
             )
             if upcoming is not None:
