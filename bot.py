@@ -19,6 +19,7 @@ from telegram.ext import (
 )
 
 import config
+import metrics
 import todoist
 from agent import build_graph, check_model, run
 from memory import Memory
@@ -39,8 +40,8 @@ GREETING = (
     "  delete the milk task\n\n"
     f"I'll also check in at {config.MORNING_TIME:%H:%M} with what's due and at "
     f"{config.EVENING_TIME:%H:%M} with what got done. "
-    "Send /memory to see what I've learned about your habits, and /nudge to run the "
-    "overdue check right now."
+    "Send /memory to see what I've learned about your habits, /nudge to run the "
+    "overdue check right now, and /status for how the last day went."
 )
 
 
@@ -67,8 +68,17 @@ async def on_nudge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Run the overdue check now and say what it saw -- so the job can be
     tested without waiting for its next tick or reading the log."""
     if _is_allowed(update):
-        outcome = await context.bot_data["proactive"].overdue_nudge()
+        outcome = await context.bot_data["proactive"].overdue_nudge(trigger="/nudge")
         await update.message.reply_text(f"Overdue check: {outcome}.")
+
+
+async def on_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The scorecard: the last day by default, `/status week` for seven."""
+    if _is_allowed(update):
+        days = 7 if (context.args or [""])[0].lower() in ("week", "7d") else 1
+        await update.message.reply_text(
+            metrics.scorecard(context.bot_data["memory"], days=days).text()
+        )
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -183,6 +193,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("memory", on_memory))
     app.add_handler(CommandHandler("nudge", on_nudge))
+    app.add_handler(CommandHandler("status", on_status))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.add_error_handler(on_error)
 

@@ -135,6 +135,14 @@ TELEGRAM_CHAT_ID = _chat_id(
 )
 
 
+# --- The record -----------------------------------------------------------------------
+# The git commit the running code came from, stamped on every recorded run so
+# a change in behaviour can be traced to a change in code. Railway sets
+# RAILWAY_GIT_COMMIT_SHA on every deploy; set NEXUS_COMMIT yourself elsewhere.
+# Empty means unknown -- a laptop checkout, usually.
+COMMIT = (os.getenv("NEXUS_COMMIT") or os.getenv("RAILWAY_GIT_COMMIT_SHA", ""))[:12]
+
+
 # --- Memory ---------------------------------------------------------------------------
 # The SQLite file holding the interaction log, the learned habits and the
 # scheduler's state. On a host, point this at a mounted volume (the Docker

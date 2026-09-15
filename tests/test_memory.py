@@ -1,9 +1,11 @@
-"""Stage 4: the interaction log, the learned habits and the shelf.
+"""Stage 4: the interaction log, the learned habits and the shelf -- and, from
+Stage 5, the record of runs.
 
 Every test uses a fresh in-RAM database and a fake clock, so nothing here
 depends on the wall clock or the filesystem (except the one test about files).
 """
 
+import sqlite3
 import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -12,7 +14,7 @@ import pytest
 
 import config
 import memory as memory_module
-from memory import Memory, Pattern, topic, words
+from memory import Memory, Pattern, Run, run_id, topic, words
 from tests.support import log_rows
 
 TZ = ZoneInfo("America/Toronto")
@@ -150,7 +152,7 @@ def test_tool_rows_keep_their_arguments_and_outcome():
     memory, _ = make()
     detail = {"args": {"content": "milk"}, "outcome": "ok"}
 
-    memory.log(7, "tool", "Created [1] milk", kind="create_task", detail=detail)
+    memory.log(7, "tool", "Created [1] milk", kind="create_task", detail=detail, run_id="r1")
 
     assert log_rows(memory) == [
         {
@@ -159,6 +161,7 @@ def test_tool_rows_keep_their_arguments_and_outcome():
             "kind": "create_task",
             "text": "Created [1] milk",
             "detail": detail,
+            "run_id": "r1",
         }
     ]
 
@@ -576,3 +579,107 @@ def test_writes_from_many_threads_are_serialised():
 
     assert memory.counts() == (200, 1)
     assert pattern(memory, "gym").created == 200
+
+
+# --- The record ---------------------------------------------------------------------
+
+
+def a_run(when, **overrides):
+    values = {
+        "id": "abc123def456",
+        "ts": when,
+        "chat_id": 7,
+        "kind": "message",
+        "trigger": "add milk",
+        "reply": "Added it.",
+        "outcome": "ok",
+        "latency_ms": 1234,
+        "steps": 2,
+        "retries": 1,
+        "calls": 2,
+        "tool_calls": 1,
+        "input_tokens": 300,
+        "output_tokens": 40,
+        "cache_read_tokens": 100,
+        "model": "claude-haiku-4-5",
+        "prompt": "deadbeef0123",
+        "build": "4c43a30",
+        "error": "",
+        "trace": {"steps": [{"role": "tool", "outcome": "ok"}], "reply": "Added it."},
+    }
+    return Run(**{**values, **overrides})
+
+
+def test_record_and_runs_round_trip():
+    memory, clock = make()
+    run = a_run(clock["now"])
+
+    memory.record(run)
+
+    assert memory.runs(at(0)) == [run]
+    assert memory.runs(at(0))[0].ts.tzinfo is TZ, "read back in the configured zone"
+
+
+def test_runs_come_from_the_window_oldest_first():
+    memory, _ = make()
+    memory.record(a_run(at(12), id="noon"))
+    memory.record(a_run(at(9), id="nine"))
+    memory.record(a_run(at(15), id="three"))
+    memory.record(a_run(at(9), id="nine-again", kind="overdue"))
+
+    assert [run.id for run in memory.runs(at(0))] == ["nine", "nine-again", "noon", "three"]
+    assert [run.id for run in memory.runs(at(9, 1), at(15))] == ["noon"], "until is exclusive"
+    assert memory.runs(at(16)) == []
+
+
+def test_a_run_needs_only_what_every_run_has():
+    memory, clock = make()
+    memory.record(Run("id1", clock["now"], 0, "morning", "clock", "", "held", 12))
+
+    [run] = memory.runs(at(0))
+    assert (run.kind, run.outcome, run.reply, run.trace) == ("morning", "held", "", {})
+    assert (run.steps, run.input_tokens, run.model, run.error) == (0, 0, "", "")
+
+
+def test_run_ids_are_short_and_unique():
+    ids = {run_id() for _ in range(100)}
+    assert len(ids) == 100
+    assert all(len(one) == 12 and int(one, 16) >= 0 for one in ids)
+
+
+def test_log_rows_carry_the_run_that_made_them():
+    memory, _ = make()
+    memory.log(7, "user", "add milk", run_id="run-1")
+    memory.log(7, "assistant", "Good morning.", kind="morning")
+
+    assert [(row["text"], row["run_id"]) for row in log_rows(memory)] == [
+        ("add milk", "run-1"),
+        ("Good morning.", None),
+    ]
+
+
+def test_an_older_database_gains_the_run_id_column(tmp_path):
+    """A database written before the record existed has an interactions table
+    without run_id; opening it must add the column, not fail on the first log."""
+    path = str(tmp_path / "old.db")
+    old = sqlite3.connect(path)
+    old.execute(
+        "CREATE TABLE interactions (id INTEGER PRIMARY KEY, ts TEXT NOT NULL, chat_id INTEGER "
+        "NOT NULL, role TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, detail TEXT)"
+    )
+    old.execute(
+        "INSERT INTO interactions (ts, chat_id, role, kind, text) VALUES "
+        "('2026-09-09T12:00:00+00:00', 7, 'user', 'message', 'hello from before')"
+    )
+    old.commit()
+    old.close()
+
+    memory = Memory(path, clock=lambda: at(13))
+    memory.log(7, "user", "hello from now", run_id="r1")
+
+    assert [(row["text"], row["run_id"]) for row in log_rows(memory)] == [
+        ("hello from before", None),
+        ("hello from now", "r1"),
+    ]
+    assert memory.runs(at(0)) == [], "the runs table exists too"
+    assert Memory(path).counts() == (2, 0), "reopening does not add the column twice"

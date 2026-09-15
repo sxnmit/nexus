@@ -27,17 +27,22 @@ counters say keeps slipping or usually runs late ("drop it, or give it a fixed
 slot?"). That is a template too, filled from integers, so it stays honest. And
 the morning snapshot and the record of what has been reported live in the same
 database, so a restart between the jobs loses neither.
+
+Every job leaves a row in the record (memory.Run): sent, held by quiet hours,
+off, silent, or Todoist unavailable -- so "the nudge never says anything" is a
+count the scorecard can show, not a feeling.
 """
 
 import asyncio
 import logging
+import time as clock_time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
 import config
 import todoist
-from memory import Memory
+from memory import Memory, Run, run_id
 
 log = logging.getLogger("nexus.proactive")
 
@@ -224,7 +229,7 @@ class Proactive:
         current = self._clock() if self._clock else datetime.now(config.TIMEZONE)
         return current.astimezone(config.TIMEZONE)
 
-    async def deliver(self, kind: str, text: str) -> bool:
+    async def deliver(self, kind: str, text: str, run: str | None = None) -> bool:
         """The gate: recipient, quiet hours, size, logging. Returns whether it went."""
         if not self.enabled:
             log.info("%s: not sent - no TELEGRAM_CHAT_ID", kind)
@@ -236,9 +241,37 @@ class Proactive:
         sent = text[:MAX_MESSAGE]
         await self.send(self.chat_id, sent)
         # Part of the conversation now: the user's next message may refer to it.
-        self.memory.log(self.chat_id, "assistant", sent, kind=kind)
+        self.memory.log(self.chat_id, "assistant", sent, kind=kind, run_id=run)
         log.info("%s: sent", kind)
         return True
+
+    def _delivery(self, sent: bool) -> str:
+        """A job's outcome from what deliver() did with its message."""
+        if sent:
+            return "sent"
+        return "off" if not self.enabled else "held"
+
+    def _begin(self) -> tuple[str, datetime, float]:
+        """A run id, when it started, and a stopwatch for _record()."""
+        return run_id(), self.now(), clock_time.perf_counter()
+
+    def _record(self, begun, kind: str, trigger: str, outcome: str, text: str, note: str = ""):
+        """One row in the record per job run, sent or not."""
+        this, started, stopwatch = begun
+        self.memory.record(
+            Run(
+                id=this,
+                ts=started,
+                chat_id=self.chat_id or 0,
+                kind=kind,
+                trigger=trigger,
+                reply=text if outcome == "sent" else "",
+                outcome=outcome,
+                latency_ms=int((clock_time.perf_counter() - stopwatch) * 1000),
+                build=config.COMMIT,
+                trace={"note": note} if note else {},
+            )
+        )
 
     def _is_reported(self, task: dict) -> bool:
         return self.reported.get(_task_id(task)) == todoist.due_key(task)
@@ -254,12 +287,15 @@ class Proactive:
 
     async def morning_checkin(self) -> None:
         """The day's anchor: what is due, what is overdue, and an offer to reshuffle."""
+        begun = self._begin()
         now = self.now()
         today = now.date()
         try:
             tasks = await self._open_tasks()
         except todoist.TodoistError as exc:
-            await self.deliver("morning", f"Morning check-in: I couldn't reach Todoist ({exc}).")
+            text = f"Morning check-in: I couldn't reach Todoist ({exc})."
+            await self.deliver("morning", text, begun[0])
+            self._record(begun, "morning", "clock", "unavailable", "", note=str(exc))
             return
 
         due_today, overdue = _split(tasks, today)
@@ -273,19 +309,23 @@ class Proactive:
         self.reported = {tid: due for tid, due in self.reported.items() if tid in open_ids}
         self._mark_reported(due_today + overdue)
 
-        text = morning_text(due_today, overdue, today)
-        await self.deliver(
-            "morning", with_advice(text, self.memory.advice_for(due_today + overdue))
+        text = with_advice(
+            morning_text(due_today, overdue, today), self.memory.advice_for(due_today + overdue)
         )
+        sent = await self.deliver("morning", text, begun[0])
+        self._record(begun, "morning", "clock", self._delivery(sent), text)
 
     async def evening_review(self) -> None:
         """Done vs still open, diffed against the morning snapshot."""
+        begun = self._begin()
         now = self.now()
         today = now.date()
         try:
             tasks = await self._open_tasks()
         except todoist.TodoistError as exc:
-            await self.deliver("evening", f"Evening review: I couldn't reach Todoist ({exc}).")
+            text = f"Evening review: I couldn't reach Todoist ({exc})."
+            await self.deliver("evening", text, begun[0])
+            self._record(begun, "evening", "clock", "unavailable", "", note=str(exc))
             return
 
         open_ids = {_task_id(task) for task in tasks}
@@ -301,24 +341,31 @@ class Proactive:
 
         if not done and not still_open:
             log.info("evening: nothing to review")  # rule 3
+            self._record(begun, "evening", "clock", "silent", "", note="nothing to review")
             return
 
         self._mark_reported(still_open)
-        text = evening_text(done, still_open, today, started_at)
-        await self.deliver("evening", with_advice(text, self.memory.advice_for(still_open)))
+        text = with_advice(
+            evening_text(done, still_open, today, started_at), self.memory.advice_for(still_open)
+        )
+        sent = await self.deliver("evening", text, begun[0])
+        self._record(begun, "evening", "clock", self._delivery(sent), text)
 
-    async def overdue_nudge(self) -> str:
+    async def overdue_nudge(self, trigger: str = "clock") -> str:
         """Timed tasks that just went overdue, each reported once.
 
         Returns a one-line account of what it did. The job logs it; /nudge
-        replies with it, so the check can be run and read on demand.
+        replies with it, so the check can be run and read on demand. `trigger`
+        says which of those it was, for the record.
         """
+        begun = self._begin()
         now = self.now()
         try:
             tasks = await self._open_tasks()
         except todoist.TodoistError as exc:
             outcome = f"Todoist unavailable ({exc})"
             log.warning("nudge: %s", outcome)  # every 15 min: log, don't message
+            self._record(begun, "overdue", trigger, "unavailable", "", note=str(exc))
             return outcome
 
         fresh, timed, reported, upcoming = [], 0, 0, None
@@ -344,12 +391,15 @@ class Proactive:
                 when, task = upcoming
                 outcome += f"; next up: '{task.get('content')}' at {_when(when, now)}"
             log.info("nudge: %s", outcome)
+            self._record(begun, "overdue", trigger, "silent", "", note=outcome)
             return outcome
 
         fresh.sort(key=lambda pair: pair[0])
         overdue = [task for _, task in fresh]
         text = with_advice(nudge_text(fresh, now), self.memory.advice_for(overdue))
-        if await self.deliver("nudge", text):
+        sent = await self.deliver("nudge", text, begun[0])
+        self._record(begun, "overdue", trigger, self._delivery(sent), text)
+        if sent:
             # Rule 4: only what was actually sent counts as reported. Held in
             # quiet hours -> tried again next check.
             self._mark_reported(overdue)

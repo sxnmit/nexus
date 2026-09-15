@@ -24,10 +24,11 @@ def make_update(text="hello", user_id=42, chat_id=7, has_user=True):
     )
 
 
-def make_context(graph="the-graph", memory="the-memory", proactive=None):
+def make_context(graph="the-graph", memory="the-memory", proactive=None, args=()):
     return SimpleNamespace(
         bot=SimpleNamespace(send_chat_action=AsyncMock()),
         bot_data={"graph": graph, "memory": memory, "proactive": proactive},
+        args=list(args),
     )
 
 
@@ -162,7 +163,7 @@ def test_on_nudge_runs_the_overdue_check_and_reports(open_bot):
 
     asyncio.run(bot.on_nudge(update, make_context(proactive=proactive)))
 
-    proactive.overdue_nudge.assert_awaited_once()
+    proactive.overdue_nudge.assert_awaited_once_with(trigger="/nudge")
     update.message.reply_text.assert_awaited_once_with("Overdue check: nudged about 1 task(s).")
 
 
@@ -173,6 +174,43 @@ def test_on_nudge_is_silent_for_unauthorised_users(locked_bot):
     asyncio.run(bot.on_nudge(update, make_context(proactive=proactive)))
 
     proactive.overdue_nudge.assert_not_awaited()
+    update.message.reply_text.assert_not_awaited()
+
+
+# --- /status ------------------------------------------------------------------
+
+
+def test_on_status_replies_with_the_scorecard(open_bot, memory):
+    update = make_update("/status")
+
+    asyncio.run(bot.on_status(update, make_context(memory=memory)))
+
+    text = update.message.reply_text.await_args.args[0]
+    assert text.startswith("Last 24 hours: no replies.")
+    assert text.endswith(f"commit {config.COMMIT or 'unknown'}.")
+
+
+def test_on_status_week_covers_seven_days(open_bot, memory, monkeypatch):
+    seen = {}
+
+    def fake_scorecard(store, days):
+        seen["days"] = days
+        return SimpleNamespace(text=lambda: "card")
+
+    monkeypatch.setattr(bot.metrics, "scorecard", fake_scorecard)
+
+    asyncio.run(bot.on_status(make_update("/status week"), make_context(args=["week"])))
+    assert seen["days"] == 7
+
+    asyncio.run(bot.on_status(make_update("/status"), make_context(args=["tomorrow"])))
+    assert seen["days"] == 1, "anything that is not 'week' means the last day"
+
+
+def test_on_status_is_silent_for_unauthorised_users(locked_bot, memory):
+    update = make_update("/status", user_id=2)
+
+    asyncio.run(bot.on_status(update, make_context(memory=memory)))
+
     update.message.reply_text.assert_not_awaited()
 
 
@@ -300,7 +338,9 @@ def test_main_wires_the_handlers_and_starts_polling(monkeypatch, todoist_api, ca
     assert app.bot_data["graph"] == "the-graph"
     assert isinstance(app.bot_data["memory"], bot.Memory)
     handler_types = [type(call.args[0]).__name__ for call in app.add_handler.call_args_list]
-    assert handler_types == ["CommandHandler", "CommandHandler", "CommandHandler", "MessageHandler"]
+    assert handler_types == ["CommandHandler"] * 4 + ["MessageHandler"]
+    commands = [next(iter(call.args[0].commands)) for call in app.add_handler.call_args_list[:4]]
+    assert commands == ["start", "memory", "nudge", "status"]
     app.add_error_handler.assert_called_once_with(bot.on_error)
     assert isinstance(app.bot_data["proactive"], bot.Proactive), "/nudge needs it even when off"
     app.run_polling.assert_called_once()

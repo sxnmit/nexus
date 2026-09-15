@@ -1,14 +1,22 @@
 """Lightweight memory: an interaction log and a few learned habits, in SQLite.
 
-Three tables and no embeddings.
+Four tables and no embeddings.
 
 `interactions`  Everything said and done, in order: each user message, each
                 tool call with its arguments and outcome, each reply, and each
-                check-in the scheduler sent. It is the record -- and its last
-                few rows are the conversation memory. Before a run, `recent()`
-                hands the agent the last N messages of the chat, which is what
-                makes "push it to friday" mean something the morning after a
-                check-in.
+                check-in the scheduler sent. Its last few rows are the
+                conversation memory. Before a run, `recent()` hands the agent
+                the last N messages of the chat, which is what makes "push it
+                to friday" mean something the morning after a check-in. Each
+                row names the run that produced it.
+
+`runs`          One row per unit of work -- a message answered, a check-in
+                sent or withheld -- and how it went: the outcome, the steps
+                and retries, what the model calls cost, how long it took, and
+                a trace of what the model saw and did. The prompt version and
+                the build are on every row, so a change to either shows up in
+                what followed. This is the record an evaluator reads; the
+                scorecard in metrics.py reads it today.
 
 `patterns`      One row per *topic* -- a task name with the noise stripped, so
                 "Go to the gym tomorrow" and "gym" share a row -- holding
@@ -42,8 +50,9 @@ import json
 import re
 import sqlite3
 import threading
+import uuid
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime, timedelta
 
 import config
@@ -78,9 +87,34 @@ CREATE TABLE IF NOT EXISTS interactions (
     role    TEXT    NOT NULL,  -- user | assistant | tool
     kind    TEXT    NOT NULL,  -- message | reply | morning | evening | nudge | a tool name
     text    TEXT    NOT NULL,
-    detail  TEXT               -- JSON; for a tool call, its arguments and outcome
+    detail  TEXT,              -- JSON; for a tool call, its arguments and outcome
+    run_id  TEXT               -- the run this row belongs to (runs.id)
 );
 CREATE INDEX IF NOT EXISTS interactions_by_chat ON interactions (chat_id, ts);
+
+CREATE TABLE IF NOT EXISTS runs (
+    id                TEXT    PRIMARY KEY,   -- short random id; interaction rows carry it
+    ts                TEXT    NOT NULL,      -- UTC, ISO 8601: when the run started
+    chat_id           INTEGER NOT NULL,
+    kind              TEXT    NOT NULL,      -- message | morning | evening | overdue
+    trigger           TEXT    NOT NULL,      -- the user's message, or what fired the job
+    reply             TEXT    NOT NULL,      -- what went back; '' when nothing was sent
+    outcome           TEXT    NOT NULL,      -- see Run
+    latency_ms        INTEGER NOT NULL,
+    steps             INTEGER NOT NULL DEFAULT 0,
+    retries           INTEGER NOT NULL DEFAULT 0,
+    calls             INTEGER NOT NULL DEFAULT 0,   -- model calls
+    tool_calls        INTEGER NOT NULL DEFAULT 0,
+    input_tokens      INTEGER NOT NULL DEFAULT 0,
+    output_tokens     INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    model             TEXT    NOT NULL DEFAULT '',
+    prompt            TEXT    NOT NULL DEFAULT '',  -- agent.PROMPT_VERSION
+    build             TEXT    NOT NULL DEFAULT '',  -- the git commit, when known
+    error             TEXT    NOT NULL DEFAULT '',
+    trace             TEXT    NOT NULL DEFAULT '{}' -- JSON; see agent._trace
+);
+CREATE INDEX IF NOT EXISTS runs_by_time ON runs (ts);
 
 CREATE TABLE IF NOT EXISTS patterns (
     topic          TEXT PRIMARY KEY,
@@ -101,6 +135,10 @@ CREATE TABLE IF NOT EXISTS state (
     value TEXT NOT NULL  -- JSON
 );
 """
+
+# Columns added after a table first shipped. CREATE TABLE IF NOT EXISTS leaves
+# an existing table alone, so a database from an earlier version gets them here.
+_ADDED_COLUMNS = {"interactions": [("run_id", "TEXT")]}
 
 
 # --- Topics -------------------------------------------------------------------------
@@ -216,6 +254,58 @@ class Pattern:
         return ""
 
 
+# --- Runs -----------------------------------------------------------------------------
+
+
+def run_id() -> str:
+    """A short random id for a run, minted before the run starts so every row
+    it logs can carry it."""
+    return uuid.uuid4().hex[:12]
+
+
+@dataclass(frozen=True)
+class Run:
+    """One unit of work, as the record keeps it.
+
+    `kind` says what started it: "message" for a Telegram message answered by
+    the agent, or a job name ("morning", "evening", "overdue"). `outcome` is
+    how it ended, from a small fixed vocabulary so it can be counted:
+
+      message   ok       every tool call succeeded (or none was needed)
+                asked    a tool needed the user's help; the reply is a question
+                failed   a tool failed and no retry could help
+                stuck    the loop hit its step cap without a reply
+                crashed  an exception escaped the graph; `error` says which
+      job       sent | held (quiet hours) | off (no recipient) | silent
+                (nothing to say) | unavailable (Todoist down)
+
+    The counters and token fields are zero for a job: the templates never call
+    the model. `trace` is JSON the evaluator reads; for a message run it holds
+    what the model saw and every step it took (see agent._trace).
+    """
+
+    id: str
+    ts: datetime
+    chat_id: int
+    kind: str
+    trigger: str
+    reply: str
+    outcome: str
+    latency_ms: int
+    steps: int = 0
+    retries: int = 0
+    calls: int = 0
+    tool_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    model: str = ""
+    prompt: str = ""
+    build: str = ""
+    error: str = ""
+    trace: dict = field(default_factory=dict)
+
+
 # --- What a tool event means --------------------------------------------------------
 
 
@@ -255,6 +345,15 @@ class Memory:
         self._db.row_factory = sqlite3.Row
         with self._lock, self._db:
             self._db.executescript(_SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Add the columns a database from an earlier version is missing."""
+        for table, columns in _ADDED_COLUMNS.items():
+            present = {row["name"] for row in self._db.execute(f"PRAGMA table_info({table})")}
+            for name, kind in columns:
+                if name not in present:
+                    self._db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
 
     def now(self) -> datetime:
         current = self._clock() if self._clock else datetime.now(config.TIMEZONE)
@@ -268,12 +367,18 @@ class Memory:
     # --- The log ---------------------------------------------------------------------
 
     def log(
-        self, chat_id: int, role: str, text: str, kind: str = "message", detail: dict | None = None
+        self,
+        chat_id: int,
+        role: str,
+        text: str,
+        kind: str = "message",
+        detail: dict | None = None,
+        run_id: str | None = None,
     ) -> None:
         with self._lock, self._db:
             self._db.execute(
-                "INSERT INTO interactions (ts, chat_id, role, kind, text, detail)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO interactions (ts, chat_id, role, kind, text, detail, run_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     self._stamp(self.now()),
                     chat_id,
@@ -281,6 +386,7 @@ class Memory:
                     kind,
                     text,
                     None if detail is None else json.dumps(detail),
+                    run_id,
                 ),
             )
 
@@ -304,6 +410,41 @@ class Memory:
             interactions = self._db.execute("SELECT count(*) FROM interactions").fetchone()[0]
             topics = self._db.execute("SELECT count(*) FROM patterns").fetchone()[0]
         return interactions, topics
+
+    # --- The record ------------------------------------------------------------------
+
+    def record(self, run: Run) -> None:
+        """Keep one run. Written once, when the run is over."""
+        names = [item.name for item in fields(Run)]
+        values = {name: getattr(run, name) for name in names}
+        values["ts"] = self._stamp(run.ts)
+        values["trace"] = json.dumps(run.trace)
+        with self._lock, self._db:
+            self._db.execute(
+                f"INSERT INTO runs ({', '.join(names)})"
+                f" VALUES ({', '.join(':' + name for name in names)})",
+                values,
+            )
+
+    def runs(self, since: datetime, until: datetime | None = None) -> list[Run]:
+        """The runs that started in [since, until), oldest first."""
+        query = "SELECT * FROM runs WHERE ts >= ?"
+        params: list = [self._stamp(since)]
+        if until is not None:
+            query += " AND ts < ?"
+            params.append(self._stamp(until))
+        with self._lock:
+            rows = self._db.execute(query + " ORDER BY ts, rowid", params).fetchall()
+        return [
+            Run(
+                **{
+                    **dict(row),
+                    "ts": datetime.fromisoformat(row["ts"]).astimezone(config.TIMEZONE),
+                    "trace": json.loads(row["trace"]),
+                }
+            )
+            for row in rows
+        ]
 
     # --- The habits ------------------------------------------------------------------
 
