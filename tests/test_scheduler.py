@@ -248,6 +248,11 @@ def test_nudge_text_singular_and_plural():
     assert two.startswith("Overdue (2):\n1. A (due 2:00pm)\n2. B (due 3:00pm)")
     assert two.endswith("Done, or push them?")
 
+    mixed = scheduler.nudge_text(
+        [(at(0), dated("1", "Rent", day=8)), (at(0), dated("2", "Tax", day=7))], at(7, day=9)
+    )
+    assert mixed.startswith("Overdue (2):\n1. Rent (due yesterday)\n2. Tax (due 2 days ago)")
+
 
 # --- The gate ------------------------------------------------------------------------
 
@@ -427,13 +432,13 @@ def test_nudge_reports_a_timed_task_that_just_went_overdue_once(todoist_api):
     assert outbox.texts == ["Overdue: 'Submit PR' was due 3:00pm (20 min ago). Done, or push it?"]
     assert set(proactive.reported) == {"1"}
     assert first == "nudged about 1 task(s)"
-    assert second == "nothing newly overdue (1 open tasks, 1 with a time, 1 already reported)"
+    assert second == "nothing newly overdue (1 open tasks, 1 dated, 1 already reported)"
 
 
-def test_nudge_ignores_date_only_future_and_ancient_tasks(todoist_api, caplog):
+def test_nudge_ignores_future_ancient_and_undated_tasks(todoist_api, caplog):
     todoist_api(
         tasks=[
-            dated("date-only", "Overdue by date", day=8),
+            dated("old-date", "Overdue by date, days ago", day=6),
             timed("future", "Later today", 18),
             timed("ancient", "Last week", 15, day=1),
             {"id": "undated", "content": "Whenever"},
@@ -446,9 +451,28 @@ def test_nudge_ignores_date_only_future_and_ancient_tasks(todoist_api, caplog):
 
     assert outbox.sent == []
     assert (
-        "nudge: nothing newly overdue (4 open tasks, 2 with a time, 0 already reported); "
+        "nudge: nothing newly overdue (4 open tasks, 3 dated, 0 already reported); "
         "next up: 'Later today' at 6:00pm" in caplog.text
     ), "silence must be visibly a choice in the log, and say what ends it"
+
+
+def test_a_day_only_task_is_overdue_from_midnight_after_its_day(todoist_api):
+    todoist_api(tasks=[dated("1", "Pay rent", day=8), dated("2", "Due today", day=9)])
+    proactive, outbox, _ = make(now=at(7, 30))
+
+    outcome = run(proactive.overdue_nudge())
+
+    assert outcome == "nudged about 1 task(s)"
+    assert outbox.texts == ["Overdue: 'Pay rent' was due yesterday. Done, or push it?"]
+    assert outbox.buttons[0] == (
+        (("Done", "task:1:done"), ("Tomorrow", "task:1:tomorrow"), ("Drop", "task:1:drop")),
+    )
+
+
+def test_overdue_at():
+    assert scheduler.overdue_at(timed("1", "x", 15)) == at(15)
+    assert scheduler.overdue_at(dated("1", "x", day=9)) == at(0, day=10)
+    assert scheduler.overdue_at({"id": "1", "content": "x"}) is None
 
 
 def test_nudge_names_the_next_timed_task_even_on_another_day(todoist_api):
