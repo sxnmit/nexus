@@ -33,13 +33,15 @@ def toronto(monkeypatch):
 
 
 class Outbox:
-    """The `send` callable: records (chat_id, text)."""
+    """The `send` callable: records (chat_id, text), and any buttons apart."""
 
     def __init__(self):
         self.sent = []
+        self.buttons = []  # parallel to `sent`
 
-    async def __call__(self, chat_id, text):
+    async def __call__(self, chat_id, text, buttons=None):
         self.sent.append((chat_id, text))
+        self.buttons.append(buttons)
 
     @property
     def texts(self):
@@ -810,3 +812,12 @@ def test_nudge_held_by_quiet_hours_is_recorded_each_time(todoist_api):
     run(proactive.overdue_nudge())
 
     assert [record.outcome for record in recorded(proactive)] == ["held", "held"]
+
+
+def test_deliver_passes_buttons_through_to_the_sender():
+    proactive, outbox, _ = make()
+
+    run(proactive.deliver("review", "Build it?", "r1", (("Yes", "sug:1:yes"), ("No", "sug:1:no"))))
+    run(proactive.deliver("morning", "Good morning."))
+
+    assert outbox.buttons == [(("Yes", "sug:1:yes"), ("No", "sug:1:no")), None]

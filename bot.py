@@ -7,11 +7,12 @@ import asyncio
 import logging
 import sqlite3
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ReactionType
 from telegram.error import NetworkError
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -25,6 +26,7 @@ import todoist
 from agent import build_graph, check_model, run
 from judge import Judge, schedule_nightly
 from memory import Memory
+from review import Reviewer, schedule_weekly
 from scheduler import Proactive, Window, schedule_jobs
 
 logging.basicConfig(format="%(asctime)s  %(levelname)-7s %(name)s: %(message)s", level=logging.INFO)
@@ -165,6 +167,36 @@ async def on_judge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Judge: {line}.")
 
 
+async def on_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run the weekly review now. The review itself arrives as its own message
+    (through the proactive gate, buttons and all); this reply says what it did."""
+    if _is_allowed(update):
+        line = await context.bot_data["reviewer"].weekly(trigger="/review")
+        await update.message.reply_text(f"Review: {line}.")
+
+
+async def on_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A button on the reviewer's ask: Yes, No, or Show me. Yes and No settle
+    the suggestion and replace the ask with the outcome; Show me answers with
+    the evidence and leaves the buttons in place."""
+    query = update.callback_query
+    if query is None:
+        return
+    if not _is_allowed(update):
+        await query.answer()
+        return
+    _, suggestion_id, action = query.data.split(":")
+    reviewer = context.bot_data["reviewer"]
+    if action == "show":
+        await query.answer()
+        await query.message.reply_text(reviewer.evidence(suggestion_id))
+        return
+    # The decision may file a GitHub issue; keep that off the event loop.
+    text = await asyncio.to_thread(reviewer.decide, suggestion_id, action)
+    await query.answer()
+    await query.edit_message_text(text)
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """python-telegram-bot retries network trouble by itself -- a laptop going
     to sleep, Wi-Fi dropping -- so one line is enough for the log. Anything
@@ -176,10 +208,16 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def _sender(app):
-    """How proactive messages leave: the same bot, addressed by chat id."""
+    """How proactive messages leave: the same bot, addressed by chat id. A
+    message that asks something carries one row of buttons."""
 
-    async def send(chat_id: int, text: str) -> None:
-        await app.bot.send_message(chat_id=chat_id, text=text)
+    async def send(chat_id: int, text: str, buttons=None) -> None:
+        markup = None
+        if buttons:
+            markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton(label, callback_data=data) for label, data in buttons]]
+            )
+        await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
 
     return send
 
@@ -252,8 +290,10 @@ def main() -> None:
     app.add_handler(CommandHandler("status", on_status))
     app.add_handler(CommandHandler("bad", on_bad))
     app.add_handler(CommandHandler("judge", on_judge))
+    app.add_handler(CommandHandler("review", on_review))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.add_handler(MessageReactionHandler(on_reaction))
+    app.add_handler(CallbackQueryHandler(on_decision, pattern=r"^sug:"))
     app.add_error_handler(on_error)
 
     judge = Judge(memory)
@@ -269,6 +309,18 @@ def main() -> None:
         memory=memory,
     )
     app.bot_data["proactive"] = proactive
+    reviewer = Reviewer(memory, proactive)
+    app.bot_data["reviewer"] = reviewer
+    schedule_weekly(app, reviewer)
+    log.info(
+        "Reviewer: %s, weekly on day %d at %s; approved suggestions go to %s",
+        config.REVIEW_MODEL,
+        config.REVIEW_DAY,
+        f"{config.REVIEW_TIME:%H:%M}",
+        f"GitHub issues on {config.GITHUB_REPO}"
+        if config.GITHUB_TOKEN and config.GITHUB_REPO
+        else "you, as a brief to paste into Claude Code",
+    )
     if proactive.enabled:
         schedule_jobs(app, proactive)
         log.info(
@@ -287,8 +339,11 @@ def main() -> None:
         )
 
     log.info("Nexus is polling. Ctrl-C to stop.")
-    # Reactions are not delivered unless asked for by name.
-    app.run_polling(allowed_updates=[Update.MESSAGE, Update.MESSAGE_REACTION])
+    # Reactions are not delivered unless asked for by name; the buttons need
+    # callback queries.
+    app.run_polling(
+        allowed_updates=[Update.MESSAGE, Update.MESSAGE_REACTION, Update.CALLBACK_QUERY]
+    )
 
 
 if __name__ == "__main__":

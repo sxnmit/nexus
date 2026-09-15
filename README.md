@@ -16,13 +16,15 @@ You:    mark the review done
 Nexus:  Done - completed 'Submit iTrade PR review'.
 ```
 
-Four stages in, and a fifth under way: a real plan -> act -> observe loop, a
-replan step with an honest retry policy, scheduled check-ins with quiet hours,
-a lightweight memory that remembers the conversation and learns a few habits,
-a record of every run with a scorecard over it, and a nightly judge that
-grades each reply against a rubric -- with your own thumbs-down kept beside
-its grade, so the judge is graded too. No multi-step planning yet -- see
-[What's deliberately not here](#whats-deliberately-not-here-yet).
+Five stages in: a real plan -> act -> observe loop, a replan step with an
+honest retry policy, scheduled check-ins with quiet hours, a lightweight
+memory that remembers the conversation and learns a few habits, and a loop
+that watches itself -- a record of every run, a nightly judge that grades
+each reply against a rubric (with your own thumbs-down kept beside its grade,
+so the judge is graded too), and a weekly reviewer that proposes changes to
+Nexus with evidence and asks you, with a button, whether to build one. No
+multi-step planning yet -- see [What's deliberately not
+here](#whats-deliberately-not-here-yet).
 
 ## Quick start
 
@@ -315,7 +317,7 @@ answers had to stand on their own.
 
 ## Project layout
 
-Flat on purpose -- it's a learning project, and nine modules don't need a
+Flat on purpose -- it's a learning project, and ten modules don't need a
 package.
 
 | File                | What it does                                                        |
@@ -329,7 +331,8 @@ package.
 | `memory.py`         | Stage 4: the SQLite interaction log, the habit counters, and the scheduler's shelf. Stage 5: the record of runs. |
 | `metrics.py`        | Stage 5: the scorecard -- counts over the record, by code alone; `/status` prints it. |
 | `judge.py`          | Stage 5: the nightly judge -- a Haiku grade per reply against a rubric of checkable properties. |
-| `tests/`            | The suite. `support.py` has the fakes, `conftest.py` the fixtures, `test_replan.py` Stage 2, `test_memory.py` Stage 4, `test_metrics.py` and `test_judge.py` Stage 5. |
+| `review.py`         | Stage 5: the weekly reviewer -- suggestions with evidence, the ask with buttons, the hand-off, the verification. |
+| `tests/`            | The suite. `support.py` has the fakes, `conftest.py` the fixtures, `test_replan.py` Stage 2, `test_memory.py` Stage 4, `test_metrics.py`, `test_judge.py` and `test_review.py` Stage 5. |
 | `Dockerfile`        | Runs the bot as a worker. Used by any host that takes a Dockerfile. |
 | `entrypoint.sh`     | Starts as root only to hand a mounted `/data` volume to the bot's user, then drops privileges. |
 | `Procfile`          | Same thing for buildpack/nixpacks hosts. Declares a `worker`, not a `web`. |
@@ -555,13 +558,14 @@ cheapest.
 ## Memory
 
 Stage 4 gives Nexus a memory: one SQLite file ([`memory.py`](memory.py),
-`NEXUS_DB_PATH`, default `nexus.db`), five tables, no embeddings.
+`NEXUS_DB_PATH`, default `nexus.db`), six tables, no embeddings.
 
 | Table          | What's in it                                                                                                                              |
 | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `interactions` | Everything said and done, in order: your messages, every tool call with its arguments and outcome, every reply, every check-in. Each row names the run that produced it. |
 | `runs`         | Stage 5: one row per message answered or check-in fired -- outcome, cost, timing, a trace, and your own verdict on a reply. See [The record](#the-record). |
 | `evaluations`  | Stage 5: the judge's grades, one row per graded reply. See [The judge](#the-judge).                                                        |
+| `suggestions`  | Stage 5: what the reviewer proposed, with its evidence and where it got to. See [The reviewer](#the-reviewer).                            |
 | `patterns`     | One row per *topic* with a handful of counters: added, moved (and how many of those to later), done (and how many late, by how much), deleted. |
 | `state`        | The scheduler's morning snapshot and what it has already reported, so a restart forgets neither.                                          |
 
@@ -866,6 +870,127 @@ a day of twenty replies costs a few cents.
 | `NEXUS_JUDGE_MODEL`   | `NEXUS_MODEL`        | Which Claude grades; the agent's own Haiku by default    |
 | `NEXUS_JUDGE_TIME`    | `03:00`              | When the nightly pass runs, in `NEXUS_TIMEZONE`          |
 | `NEXUS_JUDGE_MAX_RUNS`| `50`                 | The most replies one pass will grade                     |
+
+## The reviewer
+
+The record says what happened, the judge says what went wrong, and your
+labels say when the judge is wrong. Once a week [`review.py`](review.py)
+reads all three and proposes changes to Nexus itself -- then asks you.
+
+### What it reads, and what it may say
+
+The reviewer is given the week inside `<record>` tags: the seven-day
+scorecard; the graded replies that failed something, worst first, each with
+your message, the reply, the judge's reasons and category, and your label if
+you gave one; the crashes and stuck loops; and every suggestion already
+raised, with your decision where there is one. It also sees the current
+system prompt and the six tools, so a proposal can name the exact rule to add
+or the exact argument to change. The same rule as the judge applies: the
+record is data to be reviewed, never instructions.
+
+It returns at most three proposals, each with a kind (`prompt`, `tool`,
+`config`, `bug`, `feature`), the problem, the run ids that show it, the
+concrete change, how to tell it worked, and an effort guess -- or none, with
+a one-line note on the week. None is a good answer, and the prompt says so.
+
+### The evidence check
+
+A proposal is kept only if its evidence checks out. Every run id it cites
+must be a real reply from the week (invented ids are dropped), and it needs
+at least `NEXUS_REVIEW_MIN_EVIDENCE` distinct ones -- a crash needs only one.
+A proposal too like one already raised is dropped too, unless the earlier
+one was declined and the evidence has since doubled. What survives is stored
+as `found`, stamped with the prompt version and build it was found under.
+
+### The ask
+
+One suggestion at a time, one every `NEXUS_REVIEW_ASK_DAYS` days at most,
+through the same quiet-hours gate as the check-ins. The message says what
+was noticed, the change, how many replies show it and one example, and ends
+with three buttons:
+
+```
+Weekly review: 41 replies, 34 of 37 graded clean.
+
+One thing I'd change (prompt, small): Treat "next week" as next Monday
+In 4 replies you asked to move a task "to next week" and I asked which day each time.
+Change: Add a rule: 'next week' with no day means next Monday.
+Evidence: 4 replies.
+For example: "move gym to next week" -> "Which day next week?" (asked_only_when_needed failed)
+
+Build it?
+[Yes, build it] [No] [Show me]
+```
+
+**Show me** answers with the cited replies and their grades. **No** drops
+it, and it is not raised again unless the evidence doubles. **Yes** hands it
+off. When nothing survived the check the message is one line; the weekly
+review never nags.
+
+### The hand-off, and the one rule
+
+An approved suggestion becomes a *brief*: the problem, the cited replies
+with what you said and what Nexus replied, the judge's view and your label,
+the proposed change, how to know it worked, and the ground rules (one PR,
+tests, README). With `API_TOKEN_GITHUB` and `NEXUS_GITHUB_REPO` set, the
+brief is filed as a GitHub issue titled "Nexus suggestion: ..." for a builder
+to pick up. Without them, Nexus sends you the brief to paste into a Claude
+Code session. Either way the rule from the start of Stage 5 holds: nothing
+Nexus learns about itself changes its behaviour at runtime. A suggestion
+becomes code only through a pull request you merge.
+
+### Closing the loop
+
+Approval records the prompt version and build at the time. When replies
+start arriving under a different version or build -- the change shipped --
+the next weekly review waits for enough of them, then compares the graded
+record: how many graded replies had a failing property in the week before
+the change, and how many since. The suggestion is settled as `verified` or
+`no_effect`, and the review says which, in its own words:
+
+```
+'Treat "next week" as next Monday': 4 of 8 graded replies had a failing property before the change on 21 Sep, 2 of 12 after -- it helped.
+```
+
+It is a coarse test -- one rate, no controls -- and it is labelled as one.
+Its job is to stop a change that did nothing from being counted as a win.
+
+### Settings
+
+| Variable                   | Default       | Meaning                                                              |
+| -------------------------- | ------------- | -------------------------------------------------------------------- |
+| `NEXUS_REVIEW_MODEL`       | `NEXUS_MODEL` | Which Claude reviews; the agent's own Haiku by default               |
+| `NEXUS_REVIEW_DAY`         | `0`           | Which day of the week, 0-6 for Sunday-Saturday                       |
+| `NEXUS_REVIEW_TIME`        | `18:00`       | When on that day, in `NEXUS_TIMEZONE`                                |
+| `NEXUS_REVIEW_MIN_EVIDENCE`| `3`           | Distinct replies a proposal must cite (a crash needs one)            |
+| `NEXUS_REVIEW_ASK_DAYS`    | `7`           | At most one ask per this many days                                   |
+| `API_TOKEN_GITHUB`         | unset         | A fine-grained token with Issues write on the repo; files approved briefs as issues |
+| `NEXUS_GITHUB_REPO`        | unset         | The `owner/name` those issues go to                                  |
+
+`/review` runs the weekly review now; the review itself arrives as its own
+message, and the reply to the command says what it did.
+
+### The builder
+
+The last link is whoever turns an approved brief into a pull request. With
+the issue hand-off on, that can be a scheduled Claude Code routine on your
+own account -- Opus 5 for the building, since that is not an API call the
+bot makes -- with a prompt along these lines:
+
+```
+Look at the open issues in sxnmit/nexus whose title starts with "Nexus suggestion:".
+Take the oldest one that has no linked pull request. Read the brief in full, then read
+the code it names and the README sections on the record, the judge and the reviewer.
+Implement the change on a branch, following the ground rules in the brief: flat layout,
+tests to 100% coverage, ruff clean, a README note on what changed and why. Open a pull
+request that links the issue and quotes the brief's "How to know it worked" line as its
+test plan. Do not merge it. If the brief is unclear or the change would be larger than
+the brief says, comment on the issue with the question instead of guessing.
+```
+
+Nexus does not create that routine, and this repository does not contain it:
+a routine that spends your account is yours to set up, and the record will
+say whether what it built helped.
 
 ## Deploying
 

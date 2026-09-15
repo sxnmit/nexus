@@ -1,6 +1,6 @@
 """Lightweight memory: an interaction log and a few learned habits, in SQLite.
 
-Five tables and no embeddings.
+Six tables and no embeddings.
 
 `interactions`  Everything said and done, in order: each user message, each
                 tool call with its arguments and outcome, each reply, and each
@@ -24,6 +24,11 @@ Five tables and no embeddings.
                 category, a summary, and what the grading cost. Kept apart
                 from `runs` because grades come later, from another model,
                 under a rubric that has its own version.
+
+`suggestions`   What the reviewer (review.py) proposed changing, with the run
+                ids it cited as evidence and where each proposal got to:
+                found, asked, approved or declined, and later verified or not.
+                A declined one is remembered so it is not raised again.
 
 `patterns`      One row per *topic* -- a task name with the noise stripped, so
                 "Go to the gym tomorrow" and "gym" share a row -- holding
@@ -138,6 +143,25 @@ CREATE TABLE IF NOT EXISTS evaluations (
     input_tokens  INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
     latency_ms    INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS suggestions (
+    id            TEXT    PRIMARY KEY,
+    ts            TEXT    NOT NULL,             -- UTC: when the reviewer found it
+    kind          TEXT    NOT NULL,             -- prompt | tool | config | bug | feature
+    title         TEXT    NOT NULL,
+    problem       TEXT    NOT NULL,
+    change        TEXT    NOT NULL,
+    test          TEXT    NOT NULL,             -- how to tell it worked
+    effort        TEXT    NOT NULL,             -- small | medium | large
+    evidence      TEXT    NOT NULL,             -- JSON: the run ids it cites
+    status        TEXT    NOT NULL,             -- see Suggestion
+    prompt        TEXT    NOT NULL DEFAULT '',  -- agent.PROMPT_VERSION when found
+    build         TEXT    NOT NULL DEFAULT '',  -- the git commit when found
+    asked_at      TEXT,
+    decided_at    TEXT,
+    note          TEXT    NOT NULL DEFAULT '',  -- where it went on approval, or why not
+    verified_note TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS patterns (
@@ -369,6 +393,39 @@ class Evaluation:
         return not self.failed
 
 
+# The road a suggestion travels. `found` and `asked` are the reviewer's;
+# `approved` and `declined` are the user's; the last two are the record's,
+# once enough replies have run on the changed code to say.
+SUGGESTION_STATUSES = ("found", "asked", "approved", "declined", "verified", "no_effect")
+
+
+@dataclass(frozen=True)
+class Suggestion:
+    """One thing the reviewer proposed changing, and where it got to.
+
+    `evidence` is the run ids it cited, all of them real (the reviewer's
+    answer is checked against the record before it is kept). `prompt` and
+    `build` are the versions it was found under, which is how verification
+    later knows whether anything has changed since."""
+
+    id: str
+    ts: datetime
+    kind: str
+    title: str
+    problem: str
+    change: str
+    test: str
+    effort: str
+    evidence: list
+    status: str = "found"
+    prompt: str = ""
+    build: str = ""
+    asked_at: datetime | None = None
+    decided_at: datetime | None = None
+    note: str = ""
+    verified_note: str = ""
+
+
 # --- What a tool event means --------------------------------------------------------
 
 
@@ -582,6 +639,45 @@ class Memory:
             )
             for row in rows
         }
+
+    # --- The reviewer's suggestions ---------------------------------------------------
+
+    def suggest(self, suggestion: Suggestion) -> None:
+        """Keep a suggestion, new or changed. Its id is the key."""
+        names = [item.name for item in fields(Suggestion)]
+        values = {name: getattr(suggestion, name) for name in names}
+        for name in ("ts", "asked_at", "decided_at"):
+            values[name] = None if values[name] is None else self._stamp(values[name])
+        values["evidence"] = json.dumps(suggestion.evidence)
+        with self._lock, self._db:
+            self._db.execute(
+                f"INSERT OR REPLACE INTO suggestions ({', '.join(names)})"
+                f" VALUES ({', '.join(':' + name for name in names)})",
+                values,
+            )
+
+    def suggestion(self, suggestion_id: str) -> Suggestion | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM suggestions WHERE id = ?", (suggestion_id,)
+            ).fetchone()
+        return None if row is None else self._suggestion(row)
+
+    def suggestions(self, *statuses: str) -> list[Suggestion]:
+        """Every suggestion, newest first -- or only those in the given statuses."""
+        query = "SELECT * FROM suggestions"
+        if statuses:
+            query += f" WHERE status IN ({', '.join('?' * len(statuses))})"
+        with self._lock:
+            rows = self._db.execute(query + " ORDER BY ts DESC, rowid DESC", statuses).fetchall()
+        return [self._suggestion(row) for row in rows]
+
+    def _suggestion(self, row: sqlite3.Row) -> Suggestion:
+        values = dict(row)
+        for name in ("ts", "asked_at", "decided_at"):
+            values[name] = None if values[name] is None else self._local(values[name])
+        values["evidence"] = json.loads(values["evidence"])
+        return Suggestion(**values)
 
     def ungraded(self, since: datetime, limit: int) -> list[Run]:
         """Replies since `since` the judge has not graded, oldest first. A

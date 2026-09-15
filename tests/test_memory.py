@@ -14,7 +14,7 @@ import pytest
 
 import config
 import memory as memory_module
-from memory import Evaluation, Memory, Pattern, Run, run_id, topic, words
+from memory import Evaluation, Memory, Pattern, Run, Suggestion, run_id, topic, words
 from tests.support import log_rows
 
 TZ = ZoneInfo("America/Toronto")
@@ -808,3 +808,48 @@ def test_ungraded_is_the_replies_without_a_grade_oldest_first():
     assert [run.id for run in memory.ungraded(at(8), limit=10)] == ["nine", "noon"]
     assert [run.id for run in memory.ungraded(at(8), limit=1)] == ["nine"]
     assert [run.id for run in memory.ungraded(at(0), limit=10)] == ["early", "nine", "noon"]
+
+
+# --- The reviewer's suggestions ----------------------------------------------------------
+
+
+def a_suggestion(when, **overrides):
+    values = {
+        "id": "sug000000001",
+        "ts": when,
+        "kind": "prompt",
+        "title": "Treat next week as next Monday",
+        "problem": "It asks which day every time.",
+        "change": "Add a rule: 'next week' with no day means next Monday.",
+        "test": "asked_only_when_needed failures for 'next week' should drop to zero.",
+        "effort": "small",
+        "evidence": ["r1", "r2", "r3"],
+    }
+    return Suggestion(**{**values, **overrides})
+
+
+def test_suggestions_round_trip_and_updating_replaces():
+    memory, _ = make()
+    found = a_suggestion(at(18))
+
+    memory.suggest(found)
+
+    assert memory.suggestion("sug000000001") == found
+    assert (found.status, found.asked_at, found.decided_at, found.note) == ("found", None, None, "")
+    asked = Suggestion(**{**found.__dict__, "status": "asked", "asked_at": at(18, 5)})
+    memory.suggest(asked)
+    assert memory.suggestion("sug000000001") == asked
+    assert memory.suggestion("sug000000001").asked_at.tzinfo is TZ
+    assert memory.suggestion("nope") is None
+
+
+def test_suggestions_list_newest_first_and_filter_by_status():
+    memory, _ = make()
+    memory.suggest(a_suggestion(at(9), id="old", status="declined", decided_at=at(10)))
+    memory.suggest(a_suggestion(at(12), id="mid", status="asked", asked_at=at(12)))
+    memory.suggest(a_suggestion(at(15), id="new"))
+
+    assert [item.id for item in memory.suggestions()] == ["new", "mid", "old"]
+    assert [item.id for item in memory.suggestions("found")] == ["new"]
+    assert [item.id for item in memory.suggestions("asked", "declined")] == ["mid", "old"]
+    assert memory.suggestions("approved") == []
