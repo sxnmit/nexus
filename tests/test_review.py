@@ -384,11 +384,13 @@ def test_weekly_asks_about_the_best_suggestion_with_buttons():
     assert asked[0].asked_at == NOW
     assert outbox.buttons == [
         (
-            ("Yes, build it", f"sug:{asked[0].id}:yes"),
-            ("No", f"sug:{asked[0].id}:no"),
-            ("Show me", f"sug:{asked[0].id}:show"),
+            (
+                ("Yes, build it", f"sug:{asked[0].id}:yes"),
+                ("No", f"sug:{asked[0].id}:no"),
+                ("Show me", f"sug:{asked[0].id}:show"),
+            ),
         )
-    ]
+    ], "one row: Yes, No, Show me"
     assert [item.title for item in memory.suggestions("found")] == [
         "Treat next week as next Monday"
     ]

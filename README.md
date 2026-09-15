@@ -317,7 +317,7 @@ answers had to stand on their own.
 
 ## Project layout
 
-Flat on purpose -- it's a learning project, and ten modules don't need a
+Flat on purpose -- it's a learning project, and eleven modules don't need a
 package.
 
 | File                | What it does                                                        |
@@ -328,6 +328,7 @@ package.
 | `todoist.py`        | Thin HTTP client for the task endpoints and the Sync call reminders need. |
 | `config.py`         | Reads `.env`. Nothing raises on import; `bot.py` validates at start.|
 | `scheduler.py`      | Stage 3: the quiet-hours gate and the three time-triggered jobs.   |
+| `buttons.py`        | The nudge's Done / Tomorrow / Drop buttons: the agent's tools, without the model. |
 | `memory.py`         | Stage 4: the SQLite interaction log, the habit counters, and the scheduler's shelf. Stage 5: the record of runs. |
 | `metrics.py`        | Stage 5: the scorecard -- counts over the record, by code alone; `/status` prints it. |
 | `judge.py`          | Stage 5: the nightly judge -- a Haiku grade per reply against a rubric of checkable properties. |
@@ -507,6 +508,23 @@ from today at all -- the bot was first started after 08:00 -- the evening
 message says so ("I started at 2:00pm, so I can't see what got done before
 that") rather than pretending nothing was done. And a task created *and*
 finished within the day is invisible to the diff.
+
+### Buttons on the nudge
+
+An overdue nudge ends with a row of buttons per task -- **Done**,
+**Tomorrow**, **Drop** -- numbered like the list when there are several.
+A tap skips the model: [`buttons.py`](buttons.py) calls the same tool
+function the agent would have (`complete_task`, `update_task` with
+"tomorrow" at the task's own time, `delete_task`), so the same checks apply.
+The task must still be open, the change must actually take, and a failure is
+a typed one that is shown honestly: a task you already finished in the app
+says so, an outage says the buttons still work.
+
+Everything else about a tap is treated like a message that went through the
+loop. It is logged to the conversation (so "what's left?" a minute later
+knows), memory learns from the tool's event, and the record gets a `button`
+row. The nudge is edited in place with the outcome, and the tapped task's row
+of buttons disappears while any others stay.
 
 ### Why the nudge only watches timed tasks
 

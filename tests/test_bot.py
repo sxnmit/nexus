@@ -6,7 +6,7 @@ here talks to Telegram.
 
 import asyncio
 import logging
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -15,6 +15,10 @@ import pytest
 import bot
 import config
 from memory import Memory, Run
+from tests.support import log_rows
+
+InlineKeyboardButton = bot.InlineKeyboardButton
+InlineKeyboardMarkup = bot.InlineKeyboardMarkup
 
 SENT_MESSAGE_ID = 555
 
@@ -391,6 +395,107 @@ def test_on_decision_ignores_updates_without_a_query(open_bot):
     reviewer.decide.assert_not_called()
 
 
+# --- The nudge's buttons ---------------------------------------------------------
+
+
+def make_tap(data, rows, text="Overdue: 'Submit PR' was due 3:00pm. Done, or push it?", user_id=42):
+    """A callback query from a button on a nudge whose keyboard has `rows`."""
+    markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data=item) for label, item in row] for row in rows]
+    )
+    query = SimpleNamespace(
+        data=data,
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=SimpleNamespace(
+            text=text, chat=SimpleNamespace(id=7), reply_markup=markup, reply_text=AsyncMock()
+        ),
+    )
+    return SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=7),
+        message=None,
+        message_reaction=None,
+    )
+
+
+ONE_ROW = ((("Done", "task:1:done"), ("Tomorrow", "task:1:tomorrow"), ("Drop", "task:1:drop")),)
+
+
+def test_a_done_tap_completes_the_task_and_edits_the_nudge(open_bot, todoist_api):
+    todo = todoist_api(tasks=[{"id": "1", "content": "Submit PR"}])
+    context = make_context()
+    update = make_tap("task:1:done", ONE_ROW)
+
+    asyncio.run(bot.on_task_button(update, context))
+
+    assert todo.closed == ["1"]
+    update.callback_query.answer.assert_awaited_once_with("Done: 'Submit PR'")
+    update.callback_query.edit_message_text.assert_awaited_once_with(
+        "Overdue: 'Submit PR' was due 3:00pm. Done, or push it?\n\nDone: 'Submit PR'",
+        reply_markup=None,
+    )
+    memory = context.bot_data["memory"]
+    assert [(row["role"], row["kind"]) for row in log_rows(memory)] == [
+        ("user", "message"),
+        ("tool", "complete_task"),
+        ("assistant", "button"),
+    ]
+    [run] = memory.runs(memory.now() - timedelta(days=1))
+    assert (run.kind, run.trigger, run.outcome, run.reply) == (
+        "button",
+        "done:1",
+        "ok",
+        "Done: 'Submit PR'",
+    )
+
+
+def test_a_tap_on_one_of_several_tasks_keeps_the_other_rows(open_bot, todoist_api):
+    todoist_api(tasks=[{"id": "1", "content": "A"}, {"id": "2", "content": "B"}])
+    rows = (
+        (("1 Done", "task:1:done"), ("1 Drop", "task:1:drop")),
+        (("2 Done", "task:2:done"), ("2 Drop", "task:2:drop")),
+    )
+    update = make_tap("task:2:drop", rows, text="Overdue (2):\n1. A\n2. B")
+
+    asyncio.run(bot.on_task_button(update, make_context()))
+
+    kwargs = update.callback_query.edit_message_text.await_args
+    assert kwargs.args[0] == "Overdue (2):\n1. A\n2. B\n\nDeleted 'B'"
+    [row] = kwargs.kwargs["reply_markup"].inline_keyboard
+    assert [button.callback_data for button in row] == ["task:1:done", "task:1:drop"]
+
+
+def test_a_failed_tap_explains_and_leaves_the_buttons(open_bot, todoist_api):
+    todoist_api(tasks=[])  # the task is gone: completed in the app, say
+    update = make_tap("task:1:done", ONE_ROW)
+
+    asyncio.run(bot.on_task_button(update, make_context()))
+
+    update.callback_query.answer.assert_awaited_once_with(
+        "That task is no longer open, so there was nothing to do."
+    )
+    update.callback_query.edit_message_text.assert_not_awaited()
+
+
+def test_a_tap_by_a_stranger_is_acknowledged_and_ignored(locked_bot, todoist_api):
+    todo = todoist_api(tasks=[{"id": "1", "content": "Submit PR"}])
+    update = make_tap("task:1:done", ONE_ROW, user_id=2)
+
+    asyncio.run(bot.on_task_button(update, make_context()))
+
+    update.callback_query.answer.assert_awaited_once_with()
+    assert todo.closed == []
+
+
+def test_on_task_button_ignores_updates_without_a_query(open_bot):
+    update = make_update()
+    update.callback_query = None
+
+    asyncio.run(bot.on_task_button(update, make_context()))
+
+
 # --- /judge -------------------------------------------------------------------
 
 
@@ -621,6 +726,7 @@ def test_main_wires_the_handlers_and_starts_polling(monkeypatch, todoist_api, ca
         "MessageHandler",
         "MessageReactionHandler",
         "CallbackQueryHandler",
+        "CallbackQueryHandler",
     ]
     commands = [next(iter(call.args[0].commands)) for call in app.add_handler.call_args_list[:7]]
     assert commands == ["start", "memory", "nudge", "status", "bad", "judge", "review"]
@@ -693,17 +799,16 @@ def test_sender_sends_through_the_apps_bot():
     app.bot.send_message.assert_awaited_once_with(chat_id=42, text="hi", reply_markup=None)
 
 
-def test_sender_turns_buttons_into_one_row_of_an_inline_keyboard():
+def test_sender_turns_rows_of_buttons_into_an_inline_keyboard():
     app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+    rows = ((("Yes", "sug:1:yes"), ("No", "sug:1:no")), (("Done", "task:9:done"),))
 
-    asyncio.run(bot._sender(app)(42, "Build it?", (("Yes", "sug:1:yes"), ("No", "sug:1:no"))))
+    asyncio.run(bot._sender(app)(42, "Build it?", rows))
 
     markup = app.bot.send_message.await_args.kwargs["reply_markup"]
-    [row] = markup.inline_keyboard
-    assert [(button.text, button.callback_data) for button in row] == [
-        ("Yes", "sug:1:yes"),
-        ("No", "sug:1:no"),
-    ]
+    assert [
+        [(button.text, button.callback_data) for button in row] for row in markup.inline_keyboard
+    ] == [[("Yes", "sug:1:yes"), ("No", "sug:1:no")], [("Done", "task:9:done")]]
 
 
 # --- config -------------------------------------------------------------------

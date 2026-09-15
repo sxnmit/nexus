@@ -20,6 +20,7 @@ from telegram.ext import (
     filters,
 )
 
+import buttons
 import config
 import metrics
 import todoist
@@ -44,6 +45,7 @@ GREETING = (
     "  delete the milk task\n\n"
     f"I'll also check in at {config.MORNING_TIME:%H:%M} with what's due and at "
     f"{config.EVENING_TIME:%H:%M} with what got done. "
+    "An overdue nudge comes with Done / Tomorrow / Drop buttons, so one tap settles it.\n\n"
     "Send /memory to see what I've learned about your habits, /nudge to run the "
     "overdue check right now, and /status for how the last day went.\n\n"
     "If a reply gets it wrong, react to it with a thumbs-down, or send /bad and say why: "
@@ -167,6 +169,37 @@ async def on_judge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Judge: {line}.")
 
 
+async def on_task_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Done, Tomorrow or Drop on a nudge. The tap acts through the agent's own
+    tools, the nudge is edited with the outcome, and that task's row of buttons
+    goes away; a failure leaves the buttons for another try."""
+    query = update.callback_query
+    if query is None:
+        return
+    if not _is_allowed(update):
+        await query.answer()
+        return
+    _, task_id, action = query.data.split(":")
+    chat_id = query.message.chat.id
+    result = await asyncio.to_thread(
+        buttons.apply, context.bot_data["memory"], chat_id, task_id, action
+    )
+    log.info("button: %s on %s -> %s", action, task_id, result.line)
+    await query.answer(result.line[:200])
+    if not result.ok:
+        return
+    markup = query.message.reply_markup
+    rows = [
+        row
+        for row in (markup.inline_keyboard if markup else [])
+        if not any(button.callback_data.startswith(f"task:{task_id}:") for button in row)
+    ]
+    await query.edit_message_text(
+        f"{query.message.text}\n\n{result.line}",
+        reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+    )
+
+
 async def on_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Run the weekly review now. The review itself arrives as its own message
     (through the proactive gate, buttons and all); this reply says what it did."""
@@ -211,11 +244,14 @@ def _sender(app):
     """How proactive messages leave: the same bot, addressed by chat id. A
     message that asks something carries one row of buttons."""
 
-    async def send(chat_id: int, text: str, buttons=None) -> None:
+    async def send(chat_id: int, text: str, rows=None) -> None:
         markup = None
-        if buttons:
+        if rows:
             markup = InlineKeyboardMarkup(
-                [[InlineKeyboardButton(label, callback_data=data) for label, data in buttons]]
+                [
+                    [InlineKeyboardButton(label, callback_data=data) for label, data in row]
+                    for row in rows
+                ]
             )
         await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
 
@@ -294,6 +330,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.add_handler(MessageReactionHandler(on_reaction))
     app.add_handler(CallbackQueryHandler(on_decision, pattern=r"^sug:"))
+    app.add_handler(CallbackQueryHandler(on_task_button, pattern=r"^task:"))
     app.add_error_handler(on_error)
 
     judge = Judge(memory)

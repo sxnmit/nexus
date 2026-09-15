@@ -197,7 +197,7 @@ class Outcome:
 
     note: str
     text: str = ""
-    buttons: tuple[tuple[str, str], ...] = ()
+    buttons: tuple[tuple[tuple[str, str], ...], ...] = ()
     ask: Suggestion | None = None
     found: int = 0
     verified: int = 0
@@ -390,11 +390,14 @@ class Reviewer:
         )
 
     @staticmethod
-    def buttons(suggestion: Suggestion) -> tuple[tuple[str, str], ...]:
+    def buttons(suggestion: Suggestion) -> tuple[tuple[tuple[str, str], ...], ...]:
+        """One row: Yes, No, Show me."""
         return (
-            ("Yes, build it", f"sug:{suggestion.id}:yes"),
-            ("No", f"sug:{suggestion.id}:no"),
-            ("Show me", f"sug:{suggestion.id}:show"),
+            (
+                ("Yes, build it", f"sug:{suggestion.id}:yes"),
+                ("No", f"sug:{suggestion.id}:no"),
+                ("Show me", f"sug:{suggestion.id}:show"),
+            ),
         )
 
     def outcome(self, now: datetime | None = None) -> Outcome:

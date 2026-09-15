@@ -40,6 +40,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
+import buttons
 import config
 import todoist
 from memory import Memory, Run, run_id
@@ -60,7 +61,7 @@ MAX_MESSAGE = 4000
 DAILY_GRACE = timedelta(hours=1)
 NUDGE_GRACE = timedelta(minutes=5)
 
-# send(chat_id, text, buttons): buttons is None or one row of (label, callback data).
+# send(chat_id, text, buttons): buttons is None or rows of (label, callback data) pairs.
 Sender = Callable[..., Awaitable[None]]
 
 
@@ -182,7 +183,10 @@ def nudge_text(fresh: list[tuple[datetime, dict]], now: datetime) -> str:
             f"Overdue: '{task.get('content')}' was due {_clock(when)} "
             f"({_ago(now - when)} ago). Done, or push it?"
         )
-    lines = [f"- {task.get('content')} (due {_clock(when)})" for when, task in fresh]
+    lines = [
+        f"{index}. {task.get('content')} (due {_clock(when)})"
+        for index, (when, task) in enumerate(fresh, start=1)
+    ]
     return f"Overdue ({len(fresh)}):\n" + "\n".join(lines) + "\n\nDone, or push them?"
 
 
@@ -232,8 +236,8 @@ class Proactive:
 
     async def deliver(self, kind: str, text: str, run: str | None = None, buttons=None) -> bool:
         """The gate: recipient, quiet hours, size, logging. Returns whether it went.
-        `buttons` is one row of (label, callback data) pairs for a message that
-        asks something, e.g. the reviewer's Yes / No."""
+        `buttons` is rows of (label, callback data) pairs for a message that
+        asks something: the nudge's Done / Tomorrow / Drop, the reviewer's Yes / No."""
         if not self.enabled:
             log.info("%s: not sent - no TELEGRAM_CHAT_ID", kind)
             return False
@@ -400,7 +404,7 @@ class Proactive:
         fresh.sort(key=lambda pair: pair[0])
         overdue = [task for _, task in fresh]
         text = with_advice(nudge_text(fresh, now), self.memory.advice_for(overdue))
-        sent = await self.deliver("nudge", text, begun[0])
+        sent = await self.deliver("nudge", text, begun[0], buttons.rows(overdue))
         self._record(begun, "overdue", trigger, self.delivery(sent), text)
         if sent:
             # Rule 4: only what was actually sent counts as reported. Held in
