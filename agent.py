@@ -41,8 +41,18 @@ habits become a note in the prompt; after it, the exchange is logged and the
 tool events are learned from. The graph itself is pure: given the same
 messages it does the same thing, which is what keeps it testable without a
 database and keeps every read and write of memory in one place.
+
+`run()` also keeps the record: one `Run` per message with the outcome, what
+the model calls cost, how long it all took, and a trace of what the model saw
+and did (`_trace`). The nodes contribute two facts the messages would not
+otherwise carry -- how long each model and tool call took, and the observer's
+verdict on each tool call -- in the messages' `response_metadata`, which the
+model never sees either. Every run is tagged with `PROMPT_VERSION` and the
+build, so a change to the prompt or the code can be seen in what followed.
 """
 
+import hashlib
+import json
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -55,10 +65,16 @@ from pydantic import ValidationError
 
 import config
 import todoist
-from memory import Memory
+from memory import Memory, Run, run_id
 from tools import TOOLS, NeedsClarification, UnexpectedResult
 
 _TOOLS_BY_NAME = {tool.name: tool for tool in TOOLS}
+
+# What run() says when the loop ended without a reply.
+STUCK_REPLY = (
+    "I got stuck on that one - I kept trying tools without getting to an answer. "
+    "Could you rephrase it?"
+)
 
 # Claude requires the first message to be the user's. A conversation window can
 # begin with a check-in Nexus sent on its own; this stands in for the clock.
@@ -115,6 +131,21 @@ MODE_NOTES = {
         "what failed. Do not claim anything was done."
     ),
 }
+
+
+def _prompt_version() -> str:
+    """A short hash of everything besides the model that shapes its behaviour:
+    the prompt template, the mode notes, and the tools' names, descriptions
+    and argument schemas. Recorded on every run, so "did Tuesday's prompt
+    change help?" is a question the record can answer."""
+    material = json.dumps(
+        [SYSTEM_PROMPT, MODE_NOTES, [[tool.name, tool.description, tool.args] for tool in TOOLS]],
+        sort_keys=True,
+    )
+    return hashlib.sha256(material.encode()).hexdigest()[:12]
+
+
+PROMPT_VERSION = _prompt_version()
 
 
 class AgentState(MessagesState):
@@ -241,8 +272,18 @@ def _agent_node(state: AgentState, acting, responding) -> dict:
     # The system prompt is prepended rather than stored in state, so it is not
     # duplicated every time we come back round the loop.
     prompt = SystemMessage(_system_prompt(mode, state.get("memory_note", "")))
+    started = time.perf_counter()
     reply = model.invoke([prompt] + state["messages"])
+    # How long the call took, kept with the call. A copy, so the model's own
+    # object (a scripted reply, in tests) is left alone.
+    reply = reply.model_copy(
+        update={"response_metadata": {**reply.response_metadata, "latency_ms": _ms(started)}}
+    )
     return {"messages": [reply], "steps": state.get("steps", 0) + 1, "mode": "act"}
+
+
+def _ms(started: float) -> int:
+    return int((time.perf_counter() - started) * 1000)
 
 
 def _tool_node(state: AgentState) -> dict:
@@ -259,6 +300,7 @@ def _tool_node(state: AgentState) -> dict:
     for call in state["messages"][-1].tool_calls:
         tool = _TOOLS_BY_NAME.get(call["name"])
         status = "error"
+        started = time.perf_counter()
         if tool is None:
             # If the model hallucinates a tool, say so rather than crash the run.
             content, artifact = f"There is no tool called '{call['name']}'.", {"outcome": "crash"}
@@ -289,6 +331,7 @@ def _tool_node(state: AgentState) -> dict:
                 name=call["name"],
                 status=status,
                 artifact=artifact,
+                response_metadata={"latency_ms": _ms(started)},
             )
         )
 
@@ -309,10 +352,12 @@ def _latest_observations(messages) -> list[ToolMessage]:
 def _observe_node(state: AgentState) -> dict:
     """Replan: judge each observation, spend the retry budget, set the mode.
 
-    The verdict goes two places. Its note is appended to the tool result (same
+    The verdict goes three places. Its note is appended to the tool result (same
     message id, so it replaces the original in state) -- that is what the model
     reads. Its action sets `mode`, which is what the *graph* acts on: "respond"
-    for ask/fail turns off the tools for the next agent turn.
+    for ask/fail turns off the tools for the next agent turn. And the action is
+    kept on the message, for the record; a "done" needs no rewrite, so the
+    trace reads a clean outcome as done.
     """
     retries = state.get("retries", 0)
     rewritten, actions = [], []
@@ -335,6 +380,7 @@ def _observe_node(state: AgentState) -> dict:
                     id=observation.id,  # same id -> replaces the original
                     status=observation.status,
                     artifact=observation.artifact,
+                    response_metadata={**observation.response_metadata, "verdict": verdict.action},
                 )
             )
 
@@ -429,7 +475,7 @@ def _history(rows: list[tuple[str, str]]) -> list[BaseMessage]:
     return messages
 
 
-def _remember(memory: Memory, chat_id: int, new_messages: list[BaseMessage]) -> None:
+def _remember(memory: Memory, chat_id: int, new_messages: list[BaseMessage], run: str) -> None:
     """Log what the run did and learn from it: one row per tool call, and the
     event behind each successful (or half-successful) one."""
     args_by_call = {}
@@ -448,35 +494,156 @@ def _remember(memory: Memory, chat_id: int, new_messages: list[BaseMessage]) -> 
                     "args": args_by_call.get(message.tool_call_id, {}),
                     "outcome": artifact.get("outcome"),
                 },
+                run_id=run,
             )
             memory.learn(artifact.get("event"))
 
 
+# --- The record ---------------------------------------------------------------
+
+
+def _verdict(observation: ToolMessage) -> str:
+    """What the observer decided about a tool call. A clean outcome is never
+    rewritten, so it carries no verdict and simply means done."""
+    outcome = (observation.artifact or {}).get("outcome")
+    return observation.response_metadata.get("verdict", "done" if outcome == "ok" else "fail")
+
+
+def _usage(message: AIMessage) -> dict:
+    """Token counts as the API reported them, or zeros for a model that gave none."""
+    usage = message.usage_metadata or {}
+    details = usage.get("input_token_details") or {}
+    return {
+        "input": usage.get("input_tokens", 0),
+        "output": usage.get("output_tokens", 0),
+        "cache_read": details.get("cache_read", 0),
+    }
+
+
+def _trace(
+    rows: list[tuple[str, str]], note: str, user_text: str, new: list[BaseMessage], reply: str
+) -> dict:
+    """What an evaluator needs to judge a run without re-running it: what the
+    model saw (the replayed conversation, the habits note, the message), every
+    step it took -- each model call with its text, tool calls, tokens and time;
+    each tool result with its outcome and the observer's verdict -- and what
+    went back."""
+    steps = []
+    for message in new:
+        if isinstance(message, AIMessage):
+            steps.append(
+                {
+                    "role": "assistant",
+                    "text": message.text,
+                    "tool_calls": [
+                        {"id": call["id"], "name": call["name"], "args": call["args"]}
+                        for call in message.tool_calls
+                    ],
+                    "usage": _usage(message),
+                    "latency_ms": message.response_metadata.get("latency_ms"),
+                    "stop_reason": message.response_metadata.get("stop_reason"),
+                }
+            )
+        elif isinstance(message, ToolMessage):
+            artifact = message.artifact or {}
+            steps.append(
+                {
+                    "role": "tool",
+                    "name": message.name,
+                    "call_id": message.tool_call_id,
+                    "text": message.content,
+                    "outcome": artifact.get("outcome"),
+                    "status_code": artifact.get("status_code"),
+                    "verdict": _verdict(message),
+                    "latency_ms": message.response_metadata.get("latency_ms"),
+                }
+            )
+    return {
+        "history": [{"role": role, "text": text} for role, text in rows],
+        "memory_note": note,
+        "user": user_text,
+        "steps": steps,
+        "reply": reply,
+    }
+
+
+def _outcome(new: list[BaseMessage], stuck: bool) -> str:
+    """How a message run ended, from the observer's verdicts (see memory.Run)."""
+    if stuck:
+        return "stuck"
+    verdicts = [_verdict(message) for message in new if isinstance(message, ToolMessage)]
+    if "fail" in verdicts:
+        return "failed"
+    if "ask" in verdicts:
+        return "asked"
+    return "ok"
+
+
 def run(graph, user_text: str, memory: Memory, chat_id: int = 0) -> str:
-    """Run one Telegram message through the graph and return the reply text."""
+    """Run one Telegram message through the graph and return the reply text.
+
+    Around the graph: replay the recent conversation and look up the habits
+    first; afterwards log the exchange, learn from the tool events, and record
+    the run. A crash inside the graph is recorded too, then re-raised, so the
+    caller still answers honestly and the record still shows it."""
+    this = run_id()
+    started, clock = memory.now(), time.perf_counter()
     rows = memory.recent(chat_id)
     history = _history(rows)
     note = memory.note([user_text, *(text for role, text in rows if role == "user")])
-    memory.log(chat_id, "user", user_text)
+    memory.log(chat_id, "user", user_text, run_id=this)
 
-    final = graph.invoke(
-        {
-            "messages": [*history, HumanMessage(user_text)],
-            "steps": 0,
-            "retries": 0,
-            "mode": "act",
-            "memory_note": note,
-        }
-    )
-    _remember(memory, chat_id, final["messages"][len(history) + 1 :])
-
-    reply = final["messages"][-1].text.strip()
-    if not reply:
-        # We left the loop still wanting to call tools, i.e. we hit MAX_TOOL_LOOPS.
-        reply = (
-            "I got stuck on that one - I kept trying tools without getting to an "
-            "answer. Could you rephrase it?"
+    def record(reply: str, outcome: str, new: list[BaseMessage], final: dict, error: str = ""):
+        calls = [message for message in new if isinstance(message, AIMessage)]
+        usage = [_usage(message) for message in calls]
+        served = next((c.response_metadata.get("model") for c in calls), None)
+        memory.record(
+            Run(
+                id=this,
+                ts=started,
+                chat_id=chat_id,
+                kind="message",
+                trigger=user_text,
+                reply=reply,
+                outcome=outcome,
+                latency_ms=_ms(clock),
+                steps=final.get("steps", 0),
+                retries=final.get("retries", 0),
+                calls=len(calls),
+                tool_calls=sum(isinstance(message, ToolMessage) for message in new),
+                input_tokens=sum(u["input"] for u in usage),
+                output_tokens=sum(u["output"] for u in usage),
+                cache_read_tokens=sum(u["cache_read"] for u in usage),
+                model=served or config.MODEL,
+                prompt=PROMPT_VERSION,
+                build=config.COMMIT,
+                error=error,
+                trace=_trace(rows, note, user_text, new, reply),
+            )
         )
 
-    memory.log(chat_id, "assistant", reply, kind="reply")
+    try:
+        final = graph.invoke(
+            {
+                "messages": [*history, HumanMessage(user_text)],
+                "steps": 0,
+                "retries": 0,
+                "mode": "act",
+                "memory_note": note,
+            }
+        )
+    except Exception as exc:
+        record("", "crashed", [], {}, error=f"{type(exc).__name__}: {exc}")
+        raise
+
+    new = final["messages"][len(history) + 1 :]
+    _remember(memory, chat_id, new, this)
+
+    reply = final["messages"][-1].text.strip()
+    stuck = not reply  # we left the loop still wanting tools: MAX_TOOL_LOOPS
+    if stuck:
+        reply = STUCK_REPLY
+
+    memory.log(chat_id, "assistant", reply, kind="reply", run_id=this)
+    record(reply, _outcome(new, stuck), new, final)
     return reply

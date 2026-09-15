@@ -16,10 +16,11 @@ You:    mark the review done
 Nexus:  Done - completed 'Submit iTrade PR review'.
 ```
 
-Four stages in: a real plan -> act -> observe loop, a replan step with an
-honest retry policy, scheduled check-ins with quiet hours, and a lightweight
-memory that remembers the conversation and learns a few habits. No multi-step
-planning yet -- see [What's deliberately not
+Four stages in, and a fifth begun: a real plan -> act -> observe loop, a
+replan step with an honest retry policy, scheduled check-ins with quiet hours,
+a lightweight memory that remembers the conversation and learns a few habits,
+and a record of every run with a scorecard over it -- the ground an evaluator
+will stand on. No multi-step planning yet -- see [What's deliberately not
 here](#whats-deliberately-not-here-yet).
 
 ## Quick start
@@ -313,7 +314,7 @@ answers had to stand on their own.
 
 ## Project layout
 
-Flat on purpose -- it's a learning project, and seven modules don't need a
+Flat on purpose -- it's a learning project, and eight modules don't need a
 package.
 
 | File                | What it does                                                        |
@@ -324,8 +325,9 @@ package.
 | `todoist.py`        | Thin HTTP client for the task endpoints and the Sync call reminders need. |
 | `config.py`         | Reads `.env`. Nothing raises on import; `bot.py` validates at start.|
 | `scheduler.py`      | Stage 3: the quiet-hours gate and the three time-triggered jobs.   |
-| `memory.py`         | Stage 4: the SQLite interaction log, the habit counters, and the scheduler's shelf. |
-| `tests/`            | The suite. `support.py` has the fakes, `conftest.py` the fixtures, `test_replan.py` Stage 2, `test_memory.py` Stage 4. |
+| `memory.py`         | Stage 4: the SQLite interaction log, the habit counters, and the scheduler's shelf. Stage 5: the record of runs. |
+| `metrics.py`        | Stage 5: the scorecard -- counts over the record, by code alone; `/status` prints it. |
+| `tests/`            | The suite. `support.py` has the fakes, `conftest.py` the fixtures, `test_replan.py` Stage 2, `test_memory.py` Stage 4, `test_metrics.py` Stage 5. |
 | `Dockerfile`        | Runs the bot as a worker. Used by any host that takes a Dockerfile. |
 | `entrypoint.sh`     | Starts as root only to hand a mounted `/data` volume to the bot's user, then drops privileges. |
 | `Procfile`          | Same thing for buildpack/nixpacks hosts. Declares a `worker`, not a `web`. |
@@ -551,11 +553,12 @@ cheapest.
 ## Memory
 
 Stage 4 gives Nexus a memory: one SQLite file ([`memory.py`](memory.py),
-`NEXUS_DB_PATH`, default `nexus.db`), three tables, no embeddings.
+`NEXUS_DB_PATH`, default `nexus.db`), four tables, no embeddings.
 
 | Table          | What's in it                                                                                                                              |
 | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `interactions` | Everything said and done, in order: your messages, every tool call with its arguments and outcome, every reply, every check-in.            |
+| `interactions` | Everything said and done, in order: your messages, every tool call with its arguments and outcome, every reply, every check-in. Each row names the run that produced it. |
+| `runs`         | Stage 5: one row per message answered or check-in fired -- outcome, cost, timing, and a trace. See [The record](#the-record).             |
 | `patterns`     | One row per *topic* with a handful of counters: added, moved (and how many of those to later), done (and how many late, by how much), deleted. |
 | `state`        | The scheduler's morning snapshot and what it has already reported, so a restart forgets neither.                                          |
 
@@ -663,6 +666,110 @@ the table and is never mentioned.
 | `NEXUS_DB_PATH`         | `nexus.db` | The SQLite file. `/data/nexus.db` in the Docker image; `:memory:` for a dry run |
 | `NEXUS_MEMORY_MESSAGES` | `10`       | Recent messages replayed before each reply; `0` turns that off                 |
 | `NEXUS_MEMORY_HOURS`    | `12`       | How far back those messages may reach                                          |
+
+## The record
+
+Stage 5 is Nexus watching itself, and it starts with the unglamorous half:
+every run leaves a row that says what happened, in enough detail that a
+program today -- and a model next -- can grade it without re-running it.
+Nothing in this part changes what the bot does. It changes what it keeps.
+
+### What a run is
+
+One row in the `runs` table ([`memory.py`](memory.py)) per unit of work: a
+message answered by the agent, or a check-in job that fired, whether or not
+it sent anything. Every row has the same shape.
+
+| Field                                            | For a message                                                                                            | For a check-in                                                                                      |
+| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `kind`, `trigger`                                | `message`, and the text you sent                                                                         | `morning`, `evening` or `overdue`, and `clock` or `/nudge`                                          |
+| `outcome`                                        | `ok`, `asked`, `failed`, `stuck` or `crashed`                                                            | `sent`, `held` (quiet hours), `off` (no recipient), `silent` (nothing to say), `unavailable` (Todoist down) |
+| `reply`                                          | What went back                                                                                           | The text, if it was sent                                                                            |
+| `steps`, `retries`, `calls`, `tool_calls`        | Times round the loop, retries the observer granted, model calls, tool calls                              | Zero: templates never call the model                                                                |
+| `input_tokens`, `output_tokens`, `cache_read_tokens` | As the API reported them, summed over the calls                                                      | Zero                                                                                                |
+| `latency_ms`                                     | Wall clock, message in to reply out                                                                      | The job's duration                                                                                  |
+| `model`, `prompt`, `build`                       | The model that answered (from the response), a hash of the prompt and tool schemas, the git commit       | The build                                                                                           |
+| `error`                                          | The exception, when the run crashed                                                                      |                                                                                                     |
+| `trace`                                          | What the model saw and did (below)                                                                       | A one-line note, e.g. the nudge's reason for staying silent                                         |
+
+The outcome comes from the observer's verdicts, not from the reply's wording.
+`asked` means a tool needed the user (a clarify verdict); `failed` means a
+tool failed and no retry could help; `stuck` means the loop hit its step cap;
+`crashed` means an exception escaped the graph. That last one is recorded and
+then re-raised, so the bot still answers honestly *and* the record shows it.
+
+Every interaction row carries the id of the run that produced it, so the log
+and the record cross-reference. A database from before this stage gains the
+column on first open.
+
+### The trace
+
+For a message, `trace` is what an evaluator needs to judge the run without
+re-running it:
+
+- **What the model saw.** `history` (the replayed conversation),
+  `memory_note` (the habits block, if any) and `user` (the message).
+- **What it did.** `steps`, in order: every model call with its text, its
+  tool calls, its token usage, how long it took and the stop reason; and
+  every tool result with the tool, the text as the model saw it, the outcome
+  kind, the HTTP status when Todoist answered, the observer's verdict, and
+  how long the tool took.
+- **What went back.** `reply`.
+
+Two of those facts the messages would not otherwise carry -- how long each
+call took, and the verdict -- and the nodes record them in the messages'
+`response_metadata`, which the model never sees, next to the `artifact` the
+observe step already uses. The graph stays pure; it annotates as it goes.
+
+### Why the prompt version and the build are on every row
+
+A pipeline that proposes prompt changes has to know whether a change helped.
+`prompt` is a short hash of everything besides the model that shapes its
+behaviour: the system prompt template, the mode notes, and the six tools'
+names, descriptions and argument schemas. `build` is the git commit (Railway
+sets `RAILWAY_GIT_COMMIT_SHA` on every deploy; set `NEXUS_COMMIT` anywhere
+else). Group the runs by either and before-and-after is a query, not a memory.
+
+### The scorecard
+
+[`metrics.py`](metrics.py) reads the record and computes the numbers no model
+is needed for. `/status` prints the last day; `/status week` the last seven.
+
+```
+Last 24 hours: 14 replies.
+Outcomes: 11 ok, 2 asked, 1 stuck.
+Loop: 19 steps, 2 retries, 3 clarifications asked for, 1 unexpected result.
+Tool errors: list_tasks 503 x1.
+Corrections within 5 min: 1.
+Tokens: 41,200 in (12,000 from cache), 3,100 out. Replies took 2.1s typically, 6.4s at worst.
+Check-ins: evening silent x1; morning sent x1; overdue held x2, sent x1, silent x93.
+Build: claude-haiku-4-5-20251001, prompt ab08298189f5, commit 4c43a30d1e2f.
+```
+
+Two separations are deliberate. Replies and check-ins are counted apart,
+because only a reply involves the model. And a tool error keeps its HTTP
+status, so "Todoist returned 503" is never counted as the agent failing.
+
+One line is a guess. A *correction* is a follow-up within five minutes that
+opens like one ("no", "undo", "I meant") or repeats most of the request's
+words -- unless the reply was a clarifying question, in which case a fast
+follow-up is the conversation working. It is a heuristic over your words and
+is labelled as one; the judge, when it comes, confirms or clears it.
+
+### What comes next, and one rule
+
+The rest of Stage 5 builds on this table: a nightly judge (Haiku, reading the
+traces) that grades each run on a few checkable properties; a weekly reviewer
+that turns the graded record into suggestions with evidence; and a message on
+Telegram asking whether to build one. The rule holds from the start: nothing
+Nexus learns about itself changes its behaviour at runtime. A suggestion
+becomes code only through a pull request you merge.
+
+### Settings
+
+| Variable       | Default                              | Meaning                                              |
+| -------------- | ------------------------------------ | ---------------------------------------------------- |
+| `NEXUS_COMMIT` | `RAILWAY_GIT_COMMIT_SHA`, else empty | The git commit stamped on every recorded run          |
 
 ## Deploying
 

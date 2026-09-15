@@ -288,7 +288,7 @@ def tool_calls(*specs):
 def log_rows(memory):
     """The interaction log as dicts, oldest first, with the JSON detail parsed."""
     rows = memory._db.execute(
-        "SELECT chat_id, role, kind, text, detail FROM interactions ORDER BY id"
+        "SELECT chat_id, role, kind, text, detail, run_id FROM interactions ORDER BY id"
     ).fetchall()
     return [
         {
@@ -297,6 +297,7 @@ def log_rows(memory):
             "kind": row["kind"],
             "text": row["text"],
             "detail": json.loads(row["detail"]) if row["detail"] else None,
+            "run_id": row["run_id"],
         }
         for row in rows
     ]

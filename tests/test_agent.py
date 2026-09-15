@@ -2,8 +2,9 @@
 
 The observe/replan step has its own file, tests/test_replan.py."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END
 
@@ -99,7 +100,8 @@ def test_route_treats_a_missing_step_count_as_zero():
 
 
 def test_agent_node_prepends_the_system_prompt_and_counts_the_step():
-    model = ScriptedModel(AIMessage("hi"))
+    scripted = AIMessage("hi")
+    model = ScriptedModel(scripted)
 
     out = agent._agent_node({"messages": [HumanMessage("hello")], "steps": 2}, model, model)
 
@@ -107,7 +109,11 @@ def test_agent_node_prepends_the_system_prompt_and_counts_the_step():
     assert isinstance(sent[0], SystemMessage)
     assert sent[0].content.startswith("You are Nexus")
     assert sent[1:] == [HumanMessage("hello")]
-    assert out == {"messages": [AIMessage("hi")], "steps": 3, "mode": "act"}
+    assert (out["steps"], out["mode"]) == (3, "act")
+    [reply] = out["messages"]
+    assert reply.content == "hi"
+    assert reply.response_metadata["latency_ms"] >= 0, "how long the call took, for the record"
+    assert scripted.response_metadata == {}, "recorded on a copy; the model's object is untouched"
 
 
 def test_agent_node_picks_the_model_by_mode_and_says_so_in_the_prompt():
@@ -184,6 +190,15 @@ def test_tool_node_turns_an_exception_into_an_error_observation(todoist_api):
     assert out[0].content == "Todoist rejected the request: HTTP 500 - boom"
     assert out[0].tool_call_id == "call-1"
     assert out[0].artifact == {"outcome": "api_error", "status_code": 500}
+
+
+def test_tool_node_records_how_long_each_call_took(todoist_api):
+    todoist_api(tasks=[])
+
+    out = agent._tool_node({"messages": [tool_call("list_tasks", {})]})["messages"]
+
+    assert out[0].response_metadata == {"latency_ms": out[0].response_metadata["latency_ms"]}
+    assert out[0].response_metadata["latency_ms"] >= 0
 
 
 def test_tool_node_reports_an_unknown_tool_instead_of_crashing():
@@ -513,3 +528,210 @@ def test_history_conversion():
         HumanMessage(agent.CHECK_IN_MARKER),
         AIMessage("b"),
     ]
+
+
+# --- The record ---------------------------------------------------------------
+
+
+def usage(input_tokens, output_tokens, cache_read=0):
+    """usage_metadata the way langchain-anthropic fills it in."""
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "input_token_details": {"cache_read": cache_read},
+    }
+
+
+def costed(message, input_tokens, output_tokens, cache_read=0, **metadata):
+    """A scripted reply with token usage and response metadata attached."""
+    return message.model_copy(
+        update={
+            "usage_metadata": usage(input_tokens, output_tokens, cache_read),
+            "response_metadata": metadata,
+        }
+    )
+
+
+def latest_run(memory):
+    [run] = memory.runs(memory.now() - timedelta(days=1))
+    return run
+
+
+class ExplodingModel:
+    """A model whose every call raises -- an outage, an invalid key."""
+
+    def bind_tools(self, tools):
+        return self
+
+    def invoke(self, messages):
+        raise RuntimeError("boom")
+
+
+def test_run_records_what_happened_and_what_it_cost(ask, memory, todoist_api):
+    todoist_api(tasks=[{"id": "1", "content": "Buy milk"}])
+    model = ScriptedModel(
+        costed(tool_call("list_tasks", {}), 500, 20, 100, model="claude-haiku-4-5-20251001"),
+        costed(AIMessage("One task: Buy milk."), 600, 15, stop_reason="end_turn"),
+    )
+
+    ask(model, "what's on my list?")
+
+    run = latest_run(memory)
+    assert (run.kind, run.chat_id, run.trigger) == ("message", 7, "what's on my list?")
+    assert (run.reply, run.outcome, run.error) == ("One task: Buy milk.", "ok", "")
+    assert (run.steps, run.retries, run.calls, run.tool_calls) == (2, 0, 2, 1)
+    assert (run.input_tokens, run.output_tokens, run.cache_read_tokens) == (1100, 35, 100)
+    assert run.latency_ms >= 0
+    assert run.model == "claude-haiku-4-5-20251001", "the model that answered, per the response"
+    assert (run.prompt, run.build) == (agent.PROMPT_VERSION, config.COMMIT)
+
+
+def test_run_falls_back_to_the_configured_model_name(ask, memory):
+    ask(ScriptedModel(AIMessage("hi")), "hello")
+
+    run = latest_run(memory)
+    assert run.model == config.MODEL
+    assert (run.input_tokens, run.output_tokens, run.calls) == (0, 0, 1), "no usage reported"
+
+
+def test_run_traces_what_the_model_saw_and_did(ask, memory, todoist_api):
+    todoist_api(tasks=[{"id": "1", "content": "Buy milk"}])
+    memory.log(7, "assistant", "Good morning. Nothing due today.", kind="morning")
+    for _ in range(3):
+        memory.learn({"kind": "created", "task": {"id": "9", "content": "Gym"}})
+    model = ScriptedModel(
+        costed(tool_call("list_tasks", {}), 500, 20, stop_reason="tool_use"),
+        AIMessage("One task: Buy milk."),
+    )
+
+    ask(model, "what's on my list, and gym?")
+
+    trace = latest_run(memory).trace
+    assert trace["history"] == [{"role": "assistant", "text": "Good morning. Nothing due today."}]
+    assert trace["memory_note"].startswith("\n\nWhat you know about this user's habits")
+    assert trace["user"] == "what's on my list, and gym?"
+    assert trace["reply"] == "One task: Buy milk."
+    planned, observed, answered = trace["steps"]
+    assert planned == {
+        "role": "assistant",
+        "text": "",
+        "tool_calls": [{"id": "call-1", "name": "list_tasks", "args": {}}],
+        "usage": {"input": 500, "output": 20, "cache_read": 0},
+        "latency_ms": planned["latency_ms"],
+        "stop_reason": "tool_use",
+    }
+    assert observed == {
+        "role": "tool",
+        "name": "list_tasks",
+        "call_id": "call-1",
+        "text": "Open tasks:\n[1] Buy milk",
+        "outcome": "ok",
+        "status_code": None,
+        "verdict": "done",
+        "latency_ms": observed["latency_ms"],
+    }
+    assert answered["text"] == "One task: Buy milk." and answered["tool_calls"] == []
+    assert answered["usage"] == {"input": 0, "output": 0, "cache_read": 0}
+
+
+def test_run_records_the_observers_verdicts(ask, memory, todoist_api):
+    todoist_api(tasks=[], fail="HTTP 503 - down", fail_status=503, fail_times=1)
+    model = ScriptedModel(
+        tool_call("list_tasks", {}),
+        tool_call("list_tasks", {}, "call-2"),
+        AIMessage("Nothing on the list."),
+    )
+
+    ask(model, "list")
+
+    run = latest_run(memory)
+    observations = [step for step in run.trace["steps"] if step["role"] == "tool"]
+    assert [(o["outcome"], o["status_code"], o["verdict"]) for o in observations] == [
+        ("api_error", 503, "retry"),
+        ("ok", None, "done"),
+    ]
+    assert (run.retries, run.outcome) == (1, "ok"), "a retry that worked is still a clean run"
+
+
+@pytest.mark.parametrize(
+    ("fake", "expected"),
+    [
+        ({"tasks": []}, "asked"),  # nothing to complete: only the user can resolve it
+        ({"fail": "HTTP 401 - bad token", "fail_status": 401}, "failed"),
+    ],
+)
+def test_run_outcome_follows_the_verdict(ask, memory, todoist_api, fake, expected):
+    todoist_api(**fake)
+    model = ScriptedModel(tool_call("complete_task", {"task": "x"}), AIMessage("Sorry."))
+
+    ask(model, "mark x done")
+
+    assert latest_run(memory).outcome == expected
+
+
+def test_run_records_a_stuck_loop(ask, memory, todoist_api, monkeypatch):
+    todoist_api(tasks=[])
+    monkeypatch.setattr(config, "MAX_TOOL_LOOPS", 1)
+    model = ScriptedModel(tool_call("list_tasks", {}), tool_call("list_tasks", {}, "call-2"))
+
+    reply = ask(model, "list")
+
+    assert reply == agent.STUCK_REPLY
+    run = latest_run(memory)
+    assert (run.outcome, run.reply, run.steps) == ("stuck", agent.STUCK_REPLY, 1)
+
+
+def test_run_records_a_crash_then_re_raises(ask, memory):
+    with pytest.raises(RuntimeError, match="boom"):
+        ask(ExplodingModel(), "hello")
+
+    run = latest_run(memory)
+    assert (run.outcome, run.reply, run.error) == ("crashed", "", "RuntimeError: boom")
+    assert (run.steps, run.calls, run.tool_calls) == (0, 0, 0)
+    assert run.trace["user"] == "hello" and run.trace["steps"] == []
+    assert [(row["role"], row["run_id"]) for row in log_rows(memory)] == [("user", run.id)], (
+        "the message is logged with the run; no reply was made"
+    )
+
+
+def test_run_tags_every_log_row_with_the_run_id(ask, memory, todoist_api):
+    todoist_api(tasks=[{"id": "1", "content": "Buy milk"}])
+    model = ScriptedModel(tool_call("complete_task", {"task": "milk"}), AIMessage("Done."))
+
+    ask(model, "milk is done")
+
+    run = latest_run(memory)
+    assert len(run.id) == 12
+    assert [(row["role"], row["run_id"]) for row in log_rows(memory)] == [
+        ("user", run.id),
+        ("tool", run.id),
+        ("assistant", run.id),
+    ]
+
+
+def test_prompt_version_is_a_short_hash_of_the_prompt_and_the_tools(monkeypatch):
+    assert len(agent.PROMPT_VERSION) == 12 and int(agent.PROMPT_VERSION, 16) >= 0
+    assert agent._prompt_version() == agent.PROMPT_VERSION, "deterministic"
+
+    monkeypatch.setattr(agent, "SYSTEM_PROMPT", agent.SYSTEM_PROMPT + " Be brief.")
+    assert agent._prompt_version() != agent.PROMPT_VERSION, "a prompt edit is a new version"
+
+
+def test_observe_keeps_the_verdict_with_the_observation():
+    observation = ToolMessage(
+        content="boom",
+        tool_call_id="call-1",
+        name="create_task",
+        id="m1",
+        status="error",
+        artifact={"outcome": "clarify"},
+        response_metadata={"latency_ms": 5},
+    )
+
+    out = agent._observe_node({"messages": [HumanMessage("x"), observation], "retries": 0})
+
+    [rewritten] = out["messages"]
+    assert rewritten.response_metadata == {"latency_ms": 5, "verdict": "ask"}
+    assert agent._verdict(rewritten) == "ask"
+    assert agent._verdict(observation) == "fail", "an unrewritten failure reads as fail"

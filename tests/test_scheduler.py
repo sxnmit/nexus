@@ -19,6 +19,7 @@ import scheduler
 import todoist
 from memory import Memory
 from scheduler import Proactive, Window
+from tests.support import log_rows
 
 TZ = ZoneInfo("America/Toronto")
 UTC = ZoneInfo("UTC")
@@ -691,3 +692,121 @@ def test_morning_checkin_forgets_reported_tasks_that_are_no_longer_open(todoist_
 
     assert proactive.reported == {"1": "2026-09-09T07:00:00"}
     assert proactive.memory.load("reported") == proactive.reported
+
+
+# --- The record ------------------------------------------------------------------------
+
+
+def recorded(proactive):
+    return proactive.memory.runs(at(0))
+
+
+def test_morning_checkin_is_recorded_as_sent(todoist_api):
+    todoist_api(tasks=[timed("1", "Submit PR", 15)])
+    proactive, outbox, _ = make()
+
+    run(proactive.morning_checkin())
+
+    [record] = recorded(proactive)
+    assert (record.kind, record.trigger, record.outcome) == ("morning", "clock", "sent")
+    assert record.reply == outbox.texts[0]
+    assert (record.chat_id, record.ts) == (42, at(8))
+    assert record.latency_ms >= 0
+    assert (record.steps, record.calls, record.input_tokens) == (0, 0, 0), "templates cost nothing"
+    assert (record.build, record.trace) == (config.COMMIT, {})
+
+
+def test_a_delivered_checkin_is_logged_under_its_run(todoist_api):
+    todoist_api(tasks=[])
+    proactive, _, _ = make()
+
+    run(proactive.morning_checkin())
+
+    [record] = recorded(proactive)
+    [row] = log_rows(proactive.memory)
+    assert (row["kind"], row["run_id"]) == ("morning", record.id)
+
+
+def test_a_checkin_held_by_quiet_hours_is_recorded_without_its_text(todoist_api):
+    todoist_api(tasks=[])
+    proactive, outbox, _ = make(now=at(23))
+
+    run(proactive.morning_checkin())
+
+    [record] = recorded(proactive)
+    assert (record.outcome, record.reply, outbox.sent) == ("held", "", [])
+
+
+def test_a_job_without_a_recipient_is_recorded_as_off(todoist_api):
+    todoist_api(tasks=[timed("1", "Submit PR", 15)])
+    proactive, _, _ = make(chat_id=None, now=at(15, 20))
+
+    run(proactive.overdue_nudge())
+
+    [record] = recorded(proactive)
+    assert (record.kind, record.outcome, record.chat_id) == ("overdue", "off", 0)
+
+
+def test_evening_review_records_its_silence(todoist_api):
+    todoist_api(tasks=[])
+    proactive, _, _ = make(now=at(21))
+
+    run(proactive.evening_review())
+
+    [record] = recorded(proactive)
+    assert (record.kind, record.outcome) == ("evening", "silent")
+    assert record.trace == {"note": "nothing to review"}
+
+
+def test_evening_review_records_a_sent_review(todoist_api):
+    todoist_api(tasks=[timed("1", "Submit PR", 15)])
+    proactive, outbox, _ = make(now=at(21))
+
+    run(proactive.evening_review())
+
+    [record] = recorded(proactive)
+    assert (record.outcome, record.reply) == ("sent", outbox.texts[0])
+
+
+@pytest.mark.parametrize("job", ["morning_checkin", "evening_review", "overdue_nudge"])
+def test_a_todoist_outage_is_recorded_as_unavailable(todoist_api, job):
+    todoist_api(fail="HTTP 503 - down", fail_status=503)
+    proactive, _, _ = make(now=at(15))
+
+    run(getattr(proactive, job)())
+
+    [record] = recorded(proactive)
+    assert (record.outcome, record.reply) == ("unavailable", "")
+    assert record.trace == {"note": "HTTP 503 - down"}
+
+
+def test_nudge_records_silence_with_its_reason(todoist_api):
+    todoist_api(tasks=[timed("1", "Submit PR", 18)])
+    proactive, _, _ = make(now=at(15))
+
+    outcome = run(proactive.overdue_nudge())
+
+    [record] = recorded(proactive)
+    assert (record.kind, record.trigger, record.outcome) == ("overdue", "clock", "silent")
+    assert record.trace == {"note": outcome}
+
+
+def test_nudge_records_what_it_sent_and_what_fired_it(todoist_api):
+    todoist_api(tasks=[timed("1", "Submit PR", 15)])
+    proactive, outbox, _ = make(now=at(15, 20))
+
+    run(proactive.overdue_nudge(trigger="/nudge"))
+
+    [record] = recorded(proactive)
+    assert (record.trigger, record.outcome, record.reply) == ("/nudge", "sent", outbox.texts[0])
+
+
+def test_nudge_held_by_quiet_hours_is_recorded_each_time(todoist_api):
+    todoist_api(tasks=[timed("1", "Submit PR", 22)])
+    proactive, _, clock = make(now=at(22, 30))
+
+    run(proactive.overdue_nudge())
+    clock["now"] = at(22, 45)
+    run(proactive.overdue_nudge())
+
+    assert [record.outcome for record in recorded(proactive)] == ["held", "held"]
