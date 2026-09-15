@@ -7,7 +7,7 @@ import pytest
 
 import config
 import metrics
-from memory import Memory, Run
+from memory import Evaluation, Memory, Run
 
 TZ = ZoneInfo("America/Toronto")
 NOW = datetime(2026, 9, 9, 18, 0, tzinfo=TZ)
@@ -275,6 +275,7 @@ def test_text_reads_as_a_short_report():
         "Loop: 9 steps, 1 retry, 1 clarification asked for, 1 unexpected result.\n"
         "Tool errors: list_tasks 503 x1.\n"
         "Corrections within 5 min: 1.\n"
+        "Judge: nothing graded yet.\n"
         "Tokens: 41,300 in (12,000 from cache), 3,100 out. "
         "Replies took 1.8s typically, 6.4s at worst.\n"
         "Check-ins: evening silent x1; morning sent x1; overdue held x1, silent x1.\n"
@@ -303,3 +304,76 @@ def test_plural():
     assert metrics._plural(1, "step") == "1 step"
     assert metrics._plural(2, "step") == "2 steps"
     assert metrics._plural(0, "retry", "retries") == "0 retries"
+
+
+# --- The judge and the labels -----------------------------------------------------
+
+
+def grade(memory, run, passed=None, category="none"):
+    verdicts = {"did_what_was_asked": True, "told_the_truth": True} | (passed or {})
+    memory.evaluate(
+        Evaluation(
+            run_id=run.id,
+            ts=NOW,
+            judge_model="claude-haiku-4-5",
+            rubric="r1",
+            passed=verdicts,
+            reasons={name: "because" for name in verdicts},
+            category=category,
+            summary="s",
+        )
+    )
+
+
+def test_scorecard_counts_the_judges_grades_and_the_labels():
+    memory = Memory()
+    graded_clean = reply(memory, 50)
+    graded_flawed = reply(memory, 40)
+    flawed_twice = reply(memory, 30)
+    reply(memory, 20)  # ungraded
+    grade(memory, graded_clean)
+    grade(memory, graded_flawed, passed={"told_the_truth": False}, category="model")
+    grade(
+        memory,
+        flawed_twice,
+        passed={"told_the_truth": False, "did_what_was_asked": False},
+        category="prompt",
+    )
+    memory.label(graded_clean.id, "bad", "it was wrong")  # disagrees with the judge
+    memory.label(graded_flawed.id, "bad")  # agrees
+    memory.label(flawed_twice.id, "good")  # disagrees
+
+    card = metrics.scorecard(memory, now=NOW)
+
+    assert (card.graded, card.flawed) == (3, 2)
+    assert card.failing == {"told_the_truth": 2, "did_what_was_asked": 1}
+    assert card.categories == {"model": 1, "prompt": 1}, "'none' is not a category to count"
+    assert card.labels == {"bad": 2, "good": 1}
+    assert (card.compared, card.agreed) == (3, 1)
+    lines = [line for line in card.text().split("\n") if line.startswith(("Judge:", "Labels:"))]
+    assert lines == [
+        "Judge: 3 of 4 graded, 2 with a failing property (did_what_was_asked x1, "
+        "told_the_truth x2); categories model x1, prompt x1.",
+        "Labels: 2 bad, 1 good; the judge agreed on 1 of 3.",
+    ]
+
+
+def test_a_label_on_an_ungraded_reply_counts_but_is_not_compared():
+    memory = Memory()
+    run = reply(memory, 10)
+    memory.label(run.id, "good")
+
+    card = metrics.scorecard(memory, now=NOW)
+
+    assert (card.labels, card.compared, card.agreed) == ({"good": 1}, 0, 0)
+    assert "Labels: 1 good.\n" in card.text()
+
+
+def test_judge_line_without_failures_or_categories():
+    memory = Memory()
+    grade(memory, reply(memory, 10))
+
+    assert (
+        "Judge: 1 of 1 graded, 0 with a failing property.\n"
+        in metrics.scorecard(memory, now=NOW).text()
+    )

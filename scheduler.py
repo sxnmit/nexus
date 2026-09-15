@@ -40,6 +40,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
+import buttons
 import config
 import todoist
 from memory import Memory, Run, run_id
@@ -60,7 +61,8 @@ MAX_MESSAGE = 4000
 DAILY_GRACE = timedelta(hours=1)
 NUDGE_GRACE = timedelta(minutes=5)
 
-Sender = Callable[[int, str], Awaitable[None]]
+# send(chat_id, text, buttons): buttons is None or rows of (label, callback data) pairs.
+Sender = Callable[..., Awaitable[None]]
 
 
 # --- Quiet hours ----------------------------------------------------------------
@@ -181,7 +183,10 @@ def nudge_text(fresh: list[tuple[datetime, dict]], now: datetime) -> str:
             f"Overdue: '{task.get('content')}' was due {_clock(when)} "
             f"({_ago(now - when)} ago). Done, or push it?"
         )
-    lines = [f"- {task.get('content')} (due {_clock(when)})" for when, task in fresh]
+    lines = [
+        f"{index}. {task.get('content')} (due {_clock(when)})"
+        for index, (when, task) in enumerate(fresh, start=1)
+    ]
     return f"Overdue ({len(fresh)}):\n" + "\n".join(lines) + "\n\nDone, or push them?"
 
 
@@ -229,8 +234,10 @@ class Proactive:
         current = self._clock() if self._clock else datetime.now(config.TIMEZONE)
         return current.astimezone(config.TIMEZONE)
 
-    async def deliver(self, kind: str, text: str, run: str | None = None) -> bool:
-        """The gate: recipient, quiet hours, size, logging. Returns whether it went."""
+    async def deliver(self, kind: str, text: str, run: str | None = None, buttons=None) -> bool:
+        """The gate: recipient, quiet hours, size, logging. Returns whether it went.
+        `buttons` is rows of (label, callback data) pairs for a message that
+        asks something: the nudge's Done / Tomorrow / Drop, the reviewer's Yes / No."""
         if not self.enabled:
             log.info("%s: not sent - no TELEGRAM_CHAT_ID", kind)
             return False
@@ -239,13 +246,13 @@ class Proactive:
             log.info("%s: held - quiet hours (%s)", kind, now.strftime("%H:%M"))
             return False
         sent = text[:MAX_MESSAGE]
-        await self.send(self.chat_id, sent)
+        await self.send(self.chat_id, sent, buttons)
         # Part of the conversation now: the user's next message may refer to it.
         self.memory.log(self.chat_id, "assistant", sent, kind=kind, run_id=run)
         log.info("%s: sent", kind)
         return True
 
-    def _delivery(self, sent: bool) -> str:
+    def delivery(self, sent: bool) -> str:
         """A job's outcome from what deliver() did with its message."""
         if sent:
             return "sent"
@@ -313,7 +320,7 @@ class Proactive:
             morning_text(due_today, overdue, today), self.memory.advice_for(due_today + overdue)
         )
         sent = await self.deliver("morning", text, begun[0])
-        self._record(begun, "morning", "clock", self._delivery(sent), text)
+        self._record(begun, "morning", "clock", self.delivery(sent), text)
 
     async def evening_review(self) -> None:
         """Done vs still open, diffed against the morning snapshot."""
@@ -349,7 +356,7 @@ class Proactive:
             evening_text(done, still_open, today, started_at), self.memory.advice_for(still_open)
         )
         sent = await self.deliver("evening", text, begun[0])
-        self._record(begun, "evening", "clock", self._delivery(sent), text)
+        self._record(begun, "evening", "clock", self.delivery(sent), text)
 
     async def overdue_nudge(self, trigger: str = "clock") -> str:
         """Timed tasks that just went overdue, each reported once.
@@ -397,8 +404,8 @@ class Proactive:
         fresh.sort(key=lambda pair: pair[0])
         overdue = [task for _, task in fresh]
         text = with_advice(nudge_text(fresh, now), self.memory.advice_for(overdue))
-        sent = await self.deliver("nudge", text, begun[0])
-        self._record(begun, "overdue", trigger, self._delivery(sent), text)
+        sent = await self.deliver("nudge", text, begun[0], buttons.rows(overdue))
+        self._record(begun, "overdue", trigger, self.delivery(sent), text)
         if sent:
             # Rule 4: only what was actually sent counts as reported. Held in
             # quiet hours -> tried again next check.

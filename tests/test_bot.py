@@ -6,7 +6,7 @@ here talks to Telegram.
 
 import asyncio
 import logging
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -14,22 +14,67 @@ import pytest
 
 import bot
 import config
+from memory import Memory, Run
+from tests.support import log_rows
+
+InlineKeyboardButton = bot.InlineKeyboardButton
+InlineKeyboardMarkup = bot.InlineKeyboardMarkup
+
+SENT_MESSAGE_ID = 555
 
 
-def make_update(text="hello", user_id=42, chat_id=7, has_user=True):
+def make_update(text="hello", user_id=42, chat_id=7, has_user=True, reaction=None):
+    """A Telegram update: a text message by default, or a reaction on one of
+    the bot's messages (`reaction` is the new list of emoji, [] for taken back)."""
+    message_reaction = None
+    if reaction is not None:
+        message_reaction = SimpleNamespace(
+            chat=SimpleNamespace(id=chat_id),
+            message_id=SENT_MESSAGE_ID,
+            new_reaction=[SimpleNamespace(type="emoji", emoji=emoji) for emoji in reaction],
+        )
     return SimpleNamespace(
-        message=SimpleNamespace(text=text, reply_text=AsyncMock()),
+        message=SimpleNamespace(
+            text=text,
+            reply_text=AsyncMock(return_value=SimpleNamespace(message_id=SENT_MESSAGE_ID)),
+        ),
+        message_reaction=message_reaction,
         effective_user=SimpleNamespace(id=user_id) if has_user else None,
         effective_chat=SimpleNamespace(id=chat_id),
     )
 
 
-def make_context(graph="the-graph", memory="the-memory", proactive=None, args=()):
+def make_context(
+    graph="the-graph", memory=None, proactive=None, judge=None, reviewer=None, args=()
+):
     return SimpleNamespace(
         bot=SimpleNamespace(send_chat_action=AsyncMock()),
-        bot_data={"graph": graph, "memory": memory, "proactive": proactive},
+        bot_data={
+            "graph": graph,
+            "memory": memory if memory is not None else Memory(),
+            "proactive": proactive,
+            "judge": judge,
+            "reviewer": reviewer,
+        },
         args=list(args),
     )
+
+
+def a_reply(memory, chat_id=7, run_id="run1", reply="Added it."):
+    """A recorded reply in `memory`, as agent.run() would leave one."""
+    memory.record(
+        Run(
+            id=run_id,
+            ts=memory.now(),
+            chat_id=chat_id,
+            kind="message",
+            trigger="add milk",
+            reply=reply,
+            outcome="ok",
+            latency_ms=1,
+        )
+    )
+    return run_id
 
 
 @pytest.fixture(autouse=True)
@@ -76,7 +121,9 @@ def test_on_message_runs_the_agent_and_replies(open_bot, monkeypatch):
 
     asyncio.run(bot.on_message(update, context))
 
-    assert calls == [("the-graph", "add milk", "the-memory", 7)], "graph, text, memory, chat id"
+    assert calls == [("the-graph", "add milk", context.bot_data["memory"], 7)], (
+        "graph, text, memory, chat id"
+    )
     context.bot.send_chat_action.assert_awaited_once()
     assert context.bot.send_chat_action.await_args.kwargs["chat_id"] == 7
     update.message.reply_text.assert_awaited_once_with("Added it.")
@@ -133,6 +180,343 @@ def test_on_message_replies_with_a_fallback_when_the_agent_crashes(open_bot, mon
     reply = update.message.reply_text.await_args.args[0]
     assert "Something broke" in reply
     assert "api down" not in reply, "internal errors stay in the logs"
+
+
+def test_on_message_remembers_which_telegram_message_carried_the_reply(open_bot, monkeypatch):
+    context = make_context()
+    memory = context.bot_data["memory"]
+
+    def fake_run(graph, text, store, chat_id):
+        a_reply(store, chat_id)  # what agent.run() leaves in the record
+        return "Added it."
+
+    monkeypatch.setattr(bot, "run", fake_run)
+
+    asyncio.run(bot.on_message(make_update("add milk"), context))
+
+    assert memory.run_for_message(7, SENT_MESSAGE_ID).id == "run1"
+
+
+def test_on_message_copes_when_no_run_was_recorded(open_bot, monkeypatch):
+    monkeypatch.setattr(bot, "run", lambda *a: "ok")
+    context = make_context()
+
+    asyncio.run(bot.on_message(make_update(), context))
+
+    assert context.bot_data["memory"].run_for_message(7, SENT_MESSAGE_ID) is None
+
+
+# --- /bad and reactions: the user's own verdicts ------------------------------
+
+
+def test_on_bad_labels_the_last_reply_with_the_note(open_bot):
+    context = make_context(args=["it", "made", "two", "tasks"])
+    a_reply(context.bot_data["memory"])
+    update = make_update("/bad it made two tasks")
+
+    asyncio.run(bot.on_bad(update, context))
+
+    run = context.bot_data["memory"].latest_run(7)
+    assert (run.label, run.label_note) == ("bad", "it made two tasks")
+    reply = update.message.reply_text.await_args.args[0]
+    assert reply.startswith("Noted. That reply is marked as wrong, with your note")
+
+
+def test_on_bad_without_a_note(open_bot):
+    context = make_context()
+    a_reply(context.bot_data["memory"])
+    update = make_update("/bad")
+
+    asyncio.run(bot.on_bad(update, context))
+
+    run = context.bot_data["memory"].latest_run(7)
+    assert (run.label, run.label_note) == ("bad", None)
+    assert "with your note" not in update.message.reply_text.await_args.args[0]
+
+
+def test_on_bad_says_so_when_there_is_nothing_to_mark(open_bot):
+    update = make_update("/bad")
+
+    asyncio.run(bot.on_bad(update, make_context()))
+
+    update.message.reply_text.assert_awaited_once_with(
+        "Nothing to mark yet - I haven't replied to anything here."
+    )
+
+
+def test_on_bad_is_silent_for_unauthorised_users(locked_bot):
+    context = make_context()
+    a_reply(context.bot_data["memory"])
+    update = make_update("/bad", user_id=2)
+
+    asyncio.run(bot.on_bad(update, context))
+
+    update.message.reply_text.assert_not_awaited()
+    assert context.bot_data["memory"].latest_run(7).label is None
+
+
+@pytest.mark.parametrize(
+    ("reaction", "label"),
+    [
+        (["\U0001f44e"], "bad"),
+        (["\U0001f44d"], "good"),
+        (["\U0001f525", "\U0001f44e"], "bad"),
+        (["\U0001f525"], None),
+        ([], None),
+    ],
+)
+def test_on_reaction_labels_the_run_behind_the_message(open_bot, reaction, label):
+    context = make_context()
+    memory = context.bot_data["memory"]
+    memory.attach_message(a_reply(memory), SENT_MESSAGE_ID)
+    memory.label("run1", "bad")  # an earlier verdict, to be replaced or cleared
+
+    asyncio.run(bot.on_reaction(make_update(reaction=reaction), context))
+
+    assert memory.latest_run(7).label == label
+
+
+def test_on_reaction_ignores_custom_emoji_reactions(open_bot):
+    context = make_context()
+    memory = context.bot_data["memory"]
+    memory.attach_message(a_reply(memory), SENT_MESSAGE_ID)
+    update = make_update(reaction=[])
+    update.message_reaction.new_reaction = [
+        SimpleNamespace(type="custom_emoji", custom_emoji_id="x")
+    ]
+
+    asyncio.run(bot.on_reaction(update, context))
+
+    assert memory.latest_run(7).label is None
+
+
+def test_on_reaction_ignores_messages_that_are_not_replies_of_ours(open_bot):
+    context = make_context()
+    a_reply(context.bot_data["memory"])  # recorded, but no message id attached
+
+    asyncio.run(bot.on_reaction(make_update(reaction=["\U0001f44e"]), context))
+
+    assert context.bot_data["memory"].latest_run(7).label is None
+
+
+def test_on_reaction_ignores_unauthorised_users_and_non_reaction_updates(locked_bot):
+    context = make_context()
+    memory = context.bot_data["memory"]
+    memory.attach_message(a_reply(memory), SENT_MESSAGE_ID)
+
+    asyncio.run(bot.on_reaction(make_update(reaction=["\U0001f44e"], user_id=2), context))
+    asyncio.run(bot.on_reaction(make_update(), context))
+
+    assert memory.latest_run(7).label is None
+
+
+# --- /review and the buttons ---------------------------------------------------
+
+
+def make_query(data, user_id=42):
+    query = SimpleNamespace(
+        data=data,
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=SimpleNamespace(reply_text=AsyncMock()),
+    )
+    return SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=7),
+        message=None,
+        message_reaction=None,
+    )
+
+
+def test_on_review_runs_the_weekly_review_now_and_reports(open_bot):
+    reviewer = SimpleNamespace(weekly=AsyncMock(return_value="found 1, asking about 'x' (sent)"))
+    update = make_update("/review")
+
+    asyncio.run(bot.on_review(update, make_context(reviewer=reviewer)))
+
+    reviewer.weekly.assert_awaited_once_with(trigger="/review")
+    update.message.reply_text.assert_awaited_once_with("Review: found 1, asking about 'x' (sent).")
+
+
+def test_on_review_is_silent_for_unauthorised_users(locked_bot):
+    reviewer = SimpleNamespace(weekly=AsyncMock())
+    update = make_update("/review", user_id=2)
+
+    asyncio.run(bot.on_review(update, make_context(reviewer=reviewer)))
+
+    reviewer.weekly.assert_not_awaited()
+    update.message.reply_text.assert_not_awaited()
+
+
+@pytest.mark.parametrize("action", ["yes", "no"])
+def test_a_decision_button_settles_the_suggestion_and_replaces_the_ask(open_bot, action):
+    reviewer = SimpleNamespace(decide=Mock(return_value=f"Settled by {action}."), evidence=Mock())
+    update = make_query(f"sug:abc123:{action}")
+
+    asyncio.run(bot.on_decision(update, make_context(reviewer=reviewer)))
+
+    reviewer.decide.assert_called_once_with("abc123", action)
+    update.callback_query.answer.assert_awaited_once()
+    update.callback_query.edit_message_text.assert_awaited_once_with(f"Settled by {action}.")
+    reviewer.evidence.assert_not_called()
+
+
+def test_show_me_answers_with_the_evidence_and_keeps_the_buttons(open_bot):
+    reviewer = SimpleNamespace(decide=Mock(), evidence=Mock(return_value="Evidence for 'x': ..."))
+    update = make_query("sug:abc123:show")
+
+    asyncio.run(bot.on_decision(update, make_context(reviewer=reviewer)))
+
+    reviewer.evidence.assert_called_once_with("abc123")
+    update.callback_query.message.reply_text.assert_awaited_once_with("Evidence for 'x': ...")
+    update.callback_query.edit_message_text.assert_not_awaited()
+    reviewer.decide.assert_not_called()
+
+
+def test_a_button_pressed_by_a_stranger_is_acknowledged_and_ignored(locked_bot):
+    reviewer = SimpleNamespace(decide=Mock(), evidence=Mock())
+    update = make_query("sug:abc123:yes", user_id=2)
+
+    asyncio.run(bot.on_decision(update, make_context(reviewer=reviewer)))
+
+    update.callback_query.answer.assert_awaited_once()
+    reviewer.decide.assert_not_called()
+    update.callback_query.edit_message_text.assert_not_awaited()
+
+
+def test_on_decision_ignores_updates_without_a_query(open_bot):
+    reviewer = SimpleNamespace(decide=Mock(), evidence=Mock())
+    update = make_update()
+    update.callback_query = None
+
+    asyncio.run(bot.on_decision(update, make_context(reviewer=reviewer)))
+
+    reviewer.decide.assert_not_called()
+
+
+# --- The nudge's buttons ---------------------------------------------------------
+
+
+def make_tap(data, rows, text="Overdue: 'Submit PR' was due 3:00pm. Done, or push it?", user_id=42):
+    """A callback query from a button on a nudge whose keyboard has `rows`."""
+    markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data=item) for label, item in row] for row in rows]
+    )
+    query = SimpleNamespace(
+        data=data,
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=SimpleNamespace(
+            text=text, chat=SimpleNamespace(id=7), reply_markup=markup, reply_text=AsyncMock()
+        ),
+    )
+    return SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=user_id),
+        effective_chat=SimpleNamespace(id=7),
+        message=None,
+        message_reaction=None,
+    )
+
+
+ONE_ROW = ((("Done", "task:1:done"), ("Tomorrow", "task:1:tomorrow"), ("Drop", "task:1:drop")),)
+
+
+def test_a_done_tap_completes_the_task_and_edits_the_nudge(open_bot, todoist_api):
+    todo = todoist_api(tasks=[{"id": "1", "content": "Submit PR"}])
+    context = make_context()
+    update = make_tap("task:1:done", ONE_ROW)
+
+    asyncio.run(bot.on_task_button(update, context))
+
+    assert todo.closed == ["1"]
+    update.callback_query.answer.assert_awaited_once_with("Done: 'Submit PR'")
+    update.callback_query.edit_message_text.assert_awaited_once_with(
+        "Overdue: 'Submit PR' was due 3:00pm. Done, or push it?\n\nDone: 'Submit PR'",
+        reply_markup=None,
+    )
+    memory = context.bot_data["memory"]
+    assert [(row["role"], row["kind"]) for row in log_rows(memory)] == [
+        ("user", "message"),
+        ("tool", "complete_task"),
+        ("assistant", "button"),
+    ]
+    [run] = memory.runs(memory.now() - timedelta(days=1))
+    assert (run.kind, run.trigger, run.outcome, run.reply) == (
+        "button",
+        "done:1",
+        "ok",
+        "Done: 'Submit PR'",
+    )
+
+
+def test_a_tap_on_one_of_several_tasks_keeps_the_other_rows(open_bot, todoist_api):
+    todoist_api(tasks=[{"id": "1", "content": "A"}, {"id": "2", "content": "B"}])
+    rows = (
+        (("1 Done", "task:1:done"), ("1 Drop", "task:1:drop")),
+        (("2 Done", "task:2:done"), ("2 Drop", "task:2:drop")),
+    )
+    update = make_tap("task:2:drop", rows, text="Overdue (2):\n1. A\n2. B")
+
+    asyncio.run(bot.on_task_button(update, make_context()))
+
+    kwargs = update.callback_query.edit_message_text.await_args
+    assert kwargs.args[0] == "Overdue (2):\n1. A\n2. B\n\nDeleted 'B'"
+    [row] = kwargs.kwargs["reply_markup"].inline_keyboard
+    assert [button.callback_data for button in row] == ["task:1:done", "task:1:drop"]
+
+
+def test_a_failed_tap_explains_and_leaves_the_buttons(open_bot, todoist_api):
+    todoist_api(tasks=[])  # the task is gone: completed in the app, say
+    update = make_tap("task:1:done", ONE_ROW)
+
+    asyncio.run(bot.on_task_button(update, make_context()))
+
+    update.callback_query.answer.assert_awaited_once_with(
+        "That task is no longer open, so there was nothing to do."
+    )
+    update.callback_query.edit_message_text.assert_not_awaited()
+
+
+def test_a_tap_by_a_stranger_is_acknowledged_and_ignored(locked_bot, todoist_api):
+    todo = todoist_api(tasks=[{"id": "1", "content": "Submit PR"}])
+    update = make_tap("task:1:done", ONE_ROW, user_id=2)
+
+    asyncio.run(bot.on_task_button(update, make_context()))
+
+    update.callback_query.answer.assert_awaited_once_with()
+    assert todo.closed == []
+
+
+def test_on_task_button_ignores_updates_without_a_query(open_bot):
+    update = make_update()
+    update.callback_query = None
+
+    asyncio.run(bot.on_task_button(update, make_context()))
+
+
+# --- /judge -------------------------------------------------------------------
+
+
+def test_on_judge_grades_now_and_reports(open_bot):
+    judge = SimpleNamespace(nightly=AsyncMock(return_value="graded 2 replies: 2 clean"))
+    update = make_update("/judge")
+
+    asyncio.run(bot.on_judge(update, make_context(judge=judge)))
+
+    judge.nightly.assert_awaited_once_with(trigger="/judge")
+    update.message.reply_text.assert_awaited_once_with("Judge: graded 2 replies: 2 clean.")
+
+
+def test_on_judge_is_silent_for_unauthorised_users(locked_bot):
+    judge = SimpleNamespace(nightly=AsyncMock())
+    update = make_update("/judge", user_id=2)
+
+    asyncio.run(bot.on_judge(update, make_context(judge=judge)))
+
+    judge.nightly.assert_not_awaited()
+    update.message.reply_text.assert_not_awaited()
 
 
 # --- /start -------------------------------------------------------------------
@@ -338,13 +722,25 @@ def test_main_wires_the_handlers_and_starts_polling(monkeypatch, todoist_api, ca
     assert app.bot_data["graph"] == "the-graph"
     assert isinstance(app.bot_data["memory"], bot.Memory)
     handler_types = [type(call.args[0]).__name__ for call in app.add_handler.call_args_list]
-    assert handler_types == ["CommandHandler"] * 4 + ["MessageHandler"]
-    commands = [next(iter(call.args[0].commands)) for call in app.add_handler.call_args_list[:4]]
-    assert commands == ["start", "memory", "nudge", "status"]
+    assert handler_types == ["CommandHandler"] * 7 + [
+        "MessageHandler",
+        "MessageReactionHandler",
+        "CallbackQueryHandler",
+        "CallbackQueryHandler",
+    ]
+    commands = [next(iter(call.args[0].commands)) for call in app.add_handler.call_args_list[:7]]
+    assert commands == ["start", "memory", "nudge", "status", "bad", "judge", "review"]
     app.add_error_handler.assert_called_once_with(bot.on_error)
     assert isinstance(app.bot_data["proactive"], bot.Proactive), "/nudge needs it even when off"
-    app.run_polling.assert_called_once()
-    assert app.job_queue.run_daily.call_count == 0, "no recipient, so no check-ins"
+    assert isinstance(app.bot_data["judge"], bot.Judge)
+    assert isinstance(app.bot_data["reviewer"], bot.Reviewer)
+    app.run_polling.assert_called_once_with(
+        allowed_updates=["message", "message_reaction", "callback_query"]
+    )
+    names = [call.kwargs["name"] for call in app.job_queue.run_daily.call_args_list]
+    assert names == ["judge", "review"], (
+        "no recipient, so no check-ins; the jobs that grade still run"
+    )
     assert "Proactive messages OFF" in caplog.text
 
 
@@ -354,7 +750,7 @@ def test_main_schedules_the_check_ins_when_there_is_a_recipient(monkeypatch, tod
     bot.main()
 
     names = [call.kwargs["name"] for call in app.job_queue.run_daily.call_args_list]
-    assert names == ["morning", "evening"]
+    assert names == ["judge", "review", "morning", "evening"]
     assert app.job_queue.run_repeating.call_args.kwargs["name"] == "overdue"
 
 
@@ -400,7 +796,19 @@ def test_sender_sends_through_the_apps_bot():
 
     asyncio.run(bot._sender(app)(42, "hi"))
 
-    app.bot.send_message.assert_awaited_once_with(chat_id=42, text="hi")
+    app.bot.send_message.assert_awaited_once_with(chat_id=42, text="hi", reply_markup=None)
+
+
+def test_sender_turns_rows_of_buttons_into_an_inline_keyboard():
+    app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+    rows = ((("Yes", "sug:1:yes"), ("No", "sug:1:no")), (("Done", "task:9:done"),))
+
+    asyncio.run(bot._sender(app)(42, "Build it?", rows))
+
+    markup = app.bot.send_message.await_args.kwargs["reply_markup"]
+    assert [
+        [(button.text, button.callback_data) for button in row] for row in markup.inline_keyboard
+    ] == [[("Yes", "sug:1:yes"), ("No", "sug:1:no")], [("Done", "task:9:done")]]
 
 
 # --- config -------------------------------------------------------------------

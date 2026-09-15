@@ -33,13 +33,15 @@ def toronto(monkeypatch):
 
 
 class Outbox:
-    """The `send` callable: records (chat_id, text)."""
+    """The `send` callable: records (chat_id, text), and any buttons apart."""
 
     def __init__(self):
         self.sent = []
+        self.buttons = []  # parallel to `sent`
 
-    async def __call__(self, chat_id, text):
+    async def __call__(self, chat_id, text, buttons=None):
         self.sent.append((chat_id, text))
+        self.buttons.append(buttons)
 
     @property
     def texts(self):
@@ -243,7 +245,7 @@ def test_nudge_text_singular_and_plural():
     assert one == "Overdue: 'Submit PR' was due 3:00pm (20 min ago). Done, or push it?"
 
     two = scheduler.nudge_text([(at(14), timed("1", "A", 14)), (at(15), timed("2", "B", 15))], now)
-    assert two.startswith("Overdue (2):\n- A (due 2:00pm)\n- B (due 3:00pm)")
+    assert two.startswith("Overdue (2):\n1. A (due 2:00pm)\n2. B (due 3:00pm)")
     assert two.endswith("Done, or push them?")
 
 
@@ -489,7 +491,11 @@ def test_nudge_batches_several_in_time_order(todoist_api):
 
     run(proactive.overdue_nudge())
 
-    assert outbox.texts[0].startswith("Overdue (2):\n- First (due 2:00pm)\n- Second (due 3:00pm)")
+    assert outbox.texts[0].startswith("Overdue (2):\n1. First (due 2:00pm)\n2. Second (due 3:00pm)")
+    assert outbox.buttons[0] == (
+        (("1 Done", "task:a:done"), ("1 Tomorrow", "task:a:tomorrow"), ("1 Drop", "task:a:drop")),
+        (("2 Done", "task:b:done"), ("2 Tomorrow", "task:b:tomorrow"), ("2 Drop", "task:b:drop")),
+    ), "one row of buttons per task, numbered like the list"
 
 
 def test_nudge_only_logs_when_todoist_is_down(todoist_api):
@@ -810,3 +816,24 @@ def test_nudge_held_by_quiet_hours_is_recorded_each_time(todoist_api):
     run(proactive.overdue_nudge())
 
     assert [record.outcome for record in recorded(proactive)] == ["held", "held"]
+
+
+def test_deliver_passes_buttons_through_to_the_sender():
+    proactive, outbox, _ = make()
+
+    rows = ((("Yes", "sug:1:yes"), ("No", "sug:1:no")),)
+    run(proactive.deliver("review", "Build it?", "r1", rows))
+    run(proactive.deliver("morning", "Good morning."))
+
+    assert outbox.buttons == [rows, None]
+
+
+def test_a_single_overdue_task_gets_plain_buttons(todoist_api):
+    todoist_api(tasks=[timed("1", "Submit PR", 15)])
+    proactive, outbox, _ = make(now=at(15, 20))
+
+    run(proactive.overdue_nudge())
+
+    assert outbox.buttons == [
+        ((("Done", "task:1:done"), ("Tomorrow", "task:1:tomorrow"), ("Drop", "task:1:drop")),)
+    ]

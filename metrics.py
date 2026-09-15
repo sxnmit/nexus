@@ -17,6 +17,10 @@ Two things the scorecard keeps apart on purpose:
   * The agent's failures from the world's. A tool error carries its HTTP
     status, so "Todoist returned 503 twice" is not "the agent failed twice".
 
+The judge's grades (judge.py) and the user's labels are counted too, and
+against each other: of the replies both have a verdict on, how often did the
+judge agree? That number is what says whether the judge can be trusted.
+
 `/status` in Telegram prints it; the reviewer, when it comes, will cite it.
 """
 
@@ -104,6 +108,13 @@ class Scorecard:
     model: str = ""
     prompt: str = ""
     build: str = ""
+    graded: int = 0  # replies the judge has graded
+    flawed: int = 0  # of those, with a failing property
+    failing: Counter = field(default_factory=Counter)  # property -> replies failing it
+    categories: Counter = field(default_factory=Counter)  # judge's category -> replies
+    labels: Counter = field(default_factory=Counter)  # "good" / "bad" -> replies
+    compared: int = 0  # replies with both a label and a grade
+    agreed: int = 0  # of those, where the judge and the user agree
 
     @property
     def reply_count(self) -> int:
@@ -124,6 +135,9 @@ class Scorecard:
             if self.tool_errors:
                 lines.append("Tool errors: " + self._tool_errors() + ".")
             lines.append(f"Corrections within {CORRECTION_MINUTES} min: {self.corrections}.")
+            lines.append("Judge: " + self._judge() + ".")
+            if self.labels:
+                lines.append("Labels: " + self._labels() + ".")
             lines.append(
                 f"Tokens: {self.input_tokens:,} in ({self.cache_read_tokens:,} from cache), "
                 f"{self.output_tokens:,} out. Replies took "
@@ -155,6 +169,28 @@ class Scorecard:
             f"{tool} {status} x{count}"
             for (tool, status), count in sorted(self.tool_errors.items())
         )
+
+    def _judge(self) -> str:
+        if not self.graded:
+            return "nothing graded yet"
+        text = f"{self.graded} of {self.reply_count} graded, {self.flawed} with a failing property"
+        if self.failing:
+            text += (
+                " (" + ", ".join(f"{name} x{n}" for name, n in sorted(self.failing.items())) + ")"
+            )
+        if self.categories:
+            text += "; categories " + ", ".join(
+                f"{name} x{n}" for name, n in sorted(self.categories.items())
+            )
+        return text
+
+    def _labels(self) -> str:
+        text = ", ".join(
+            f"{self.labels[name]} {name}" for name in ("bad", "good") if self.labels[name]
+        )
+        if self.compared:
+            text += f"; the judge agreed on {self.agreed} of {self.compared}"
+        return text
 
     def _jobs(self) -> str:
         by_kind: dict[str, list[str]] = {}
@@ -201,6 +237,22 @@ def scorecard(memory: Memory, days: int = 1, now: datetime | None = None) -> Sco
                 status = observation.get("status_code") or outcome
                 tool_errors[(observation.get("name"), str(status))] += 1
 
+    grades = memory.evaluations_for(run.id for run in replies)
+    failing: Counter = Counter()
+    categories: Counter = Counter()
+    compared = agreed = flawed = 0
+    for run in replies:
+        grade = grades.get(run.id)
+        if grade is None:
+            continue
+        flawed += not grade.clean
+        failing.update(grade.failed)
+        if grade.category != "none":
+            categories[grade.category] += 1
+        if run.label in ("good", "bad"):
+            compared += 1
+            agreed += (run.label == "bad") == (not grade.clean)
+
     latest = replies[-1] if replies else None
     return Scorecard(
         since=since,
@@ -221,4 +273,11 @@ def scorecard(memory: Memory, days: int = 1, now: datetime | None = None) -> Sco
         model=latest.model if latest else "",
         prompt=latest.prompt if latest else "",
         build=latest.build if latest else "",
+        graded=len(grades),
+        flawed=flawed,
+        failing=failing,
+        categories=categories,
+        labels=Counter(run.label for run in replies if run.label in ("good", "bad")),
+        compared=compared,
+        agreed=agreed,
     )

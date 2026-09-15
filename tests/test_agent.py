@@ -35,13 +35,13 @@ def test_graph_has_exactly_the_documented_shape():
 
 
 def test_build_llm_sends_no_workspace_header_by_default():
-    assert agent._build_llm().default_headers is None
+    assert agent.build_llm().default_headers is None
 
 
 def test_build_llm_sends_the_workspace_header_for_a_personal_access_token(monkeypatch):
     monkeypatch.setattr(agent.config, "ANTHROPIC_WORKSPACE_ID", "wrkspc_01TEST")
 
-    assert agent._build_llm().default_headers == {"anthropic-workspace-id": "wrkspc_01TEST"}
+    assert agent.build_llm().default_headers == {"anthropic-workspace-id": "wrkspc_01TEST"}
 
 
 def test_check_model_makes_exactly_one_tiny_request(monkeypatch):
@@ -52,7 +52,7 @@ def test_check_model_makes_exactly_one_tiny_request(monkeypatch):
             calls.append(messages)
             return 1
 
-    monkeypatch.setattr(agent, "_build_llm", lambda: Stub())
+    monkeypatch.setattr(agent, "build_llm", lambda: Stub())
 
     agent.check_model()
 

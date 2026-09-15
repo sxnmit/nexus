@@ -410,31 +410,33 @@ def _route(state: AgentState) -> Literal["tools", "__end__"]:
 # --- Wiring -------------------------------------------------------------------
 
 
-def _build_llm() -> ChatAnthropic:
-    """The raw Claude client; the graph binds tools onto it as needed."""
+def build_llm(model: str | None = None, max_tokens: int | None = None) -> ChatAnthropic:
+    """A raw Claude client: the agent's model by default, or another for
+    another job (the judge grades with one). The graph binds tools onto it as
+    needed."""
     headers = None
     if config.ANTHROPIC_WORKSPACE_ID:
         # An org-level personal access token has to say which workspace it is
         # acting in. A key created inside a workspace already knows.
         headers = {"anthropic-workspace-id": config.ANTHROPIC_WORKSPACE_ID}
     return ChatAnthropic(
-        model=config.MODEL,
+        model=model or config.MODEL,
         api_key=config.ANTHROPIC_API_KEY,
-        max_tokens=config.MAX_TOKENS,
+        max_tokens=max_tokens or config.MAX_TOKENS,
         default_headers=headers,
     )
 
 
 def _build_model():
     """Claude with the six tools bound, so it can emit tool calls."""
-    return _build_llm().bind_tools(TOOLS)
+    return build_llm().bind_tools(TOOLS)
 
 
 def check_model() -> None:
     """One call to the free token-count endpoint, so a bad key -- or a personal
     access token that was never told its workspace -- fails at startup instead
     of on the first message. Raises whatever the SDK raises."""
-    _build_llm().get_num_tokens_from_messages([HumanMessage("ping")])
+    build_llm().get_num_tokens_from_messages([HumanMessage("ping")])
 
 
 def build_graph(model=None):
@@ -444,7 +446,7 @@ def build_graph(model=None):
     binds the tools itself because it needs both flavours: with tools for
     acting, without for a turn whose only job is to talk to the user.
     """
-    llm = model if model is not None else _build_llm()
+    llm = model if model is not None else build_llm()
     acting = llm.bind_tools(TOOLS)
     responding = llm
 

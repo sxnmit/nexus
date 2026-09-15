@@ -135,6 +135,36 @@ TELEGRAM_CHAT_ID = _chat_id(
 )
 
 
+# --- The judge --------------------------------------------------------------------------
+# Which Claude grades the record, and when. The agent's own Haiku by default:
+# grading a transcript against a rubric of checkable properties needs less
+# judgement than holding the conversation did, and it is cheap. It runs once a
+# night over the replies it has not graded yet, at most this many per run, so
+# a busy day cannot run away with the bill.
+JUDGE_MODEL = os.getenv("NEXUS_JUDGE_MODEL", MODEL)
+JUDGE_TIME = _setting("NEXUS_JUDGE_TIME", "03:00", _parse_clock)
+JUDGE_MAX_RUNS = _setting("NEXUS_JUDGE_MAX_RUNS", "50", int)
+
+
+# --- The reviewer -----------------------------------------------------------------------
+# Once a week the reviewer reads the graded record and proposes, at most, a
+# few changes; one is put to you on Telegram with Yes / No buttons. Sunday
+# evening by default (days run 0-6, Sunday to Saturday). A suggestion needs
+# this many distinct replies as evidence, and no more than one is asked about
+# per this many days.
+REVIEW_MODEL = os.getenv("NEXUS_REVIEW_MODEL", MODEL)
+REVIEW_DAY = _setting("NEXUS_REVIEW_DAY", "0", int)
+REVIEW_TIME = _setting("NEXUS_REVIEW_TIME", "18:00", _parse_clock)
+REVIEW_MIN_EVIDENCE = _setting("NEXUS_REVIEW_MIN_EVIDENCE", "3", int)
+REVIEW_ASK_DAYS = _setting("NEXUS_REVIEW_ASK_DAYS", "7", int)
+
+# Where an approved suggestion goes. With a GitHub token that can open issues
+# on the repository, it is filed as an issue for a builder to pick up; without
+# one, Nexus sends you the brief to paste into a Claude Code session yourself.
+GITHUB_TOKEN = os.getenv("API_TOKEN_GITHUB", "")
+GITHUB_REPO = os.getenv("NEXUS_GITHUB_REPO", "")
+
+
 # --- The record -----------------------------------------------------------------------
 # The git commit the running code came from, stamped on every recorded run so
 # a change in behaviour can be traced to a change in code. Railway sets
