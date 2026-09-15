@@ -94,3 +94,10 @@ jobs:
             exit 1
           fi
           echo "OK: the image boots and stops at the Todoist check, as it must without real tokens"
+
+      - name: Check the bot runs as the non-root user
+        # The entrypoint starts as root to take ownership of the volume, then
+        # must drop to uid 1000 before running anything else.
+        run: |
+          uid=$(docker run --rm nexus id -u)
+          test "$uid" = "1000" || { echo "::error::expected uid 1000 after the entrypoint, got $uid"; exit 1; }

@@ -327,6 +327,7 @@ package.
 | `memory.py`         | Stage 4: the SQLite interaction log, the habit counters, and the scheduler's shelf. |
 | `tests/`            | The suite. `support.py` has the fakes, `conftest.py` the fixtures, `test_replan.py` Stage 2, `test_memory.py` Stage 4. |
 | `Dockerfile`        | Runs the bot as a worker. Used by any host that takes a Dockerfile. |
+| `entrypoint.sh`     | Starts as root only to hand a mounted `/data` volume to the bot's user, then drops privileges. |
 | `Procfile`          | Same thing for buildpack/nixpacks hosts. Declares a `worker`, not a `web`. |
 
 The stack: [LangGraph](https://langchain-ai.github.io/langgraph/) for the loop,
@@ -736,7 +737,10 @@ to dodge.
 4. Add a **Volume** to the service, mounted at `/data`. That is where the
    image keeps its memory database, and a volume is what makes it outlive a
    redeploy. Skip this and the bot still works; it just forgets on every
-   deploy.
+   deploy. The volume arrives owned by root; the image's entrypoint hands it
+   to the bot's user before the bot starts, so there is nothing to configure.
+   (Without that step the first start fails with "Could not open the memory
+   database at /data/nexus.db: unable to open database file".)
 5. **Stop the bot on your laptop** before this deploy finishes. Two pollers on
    one bot token fight over updates.
 6. Open the deployment's **Logs**. A good start is the same lines as local --
@@ -766,7 +770,9 @@ docker run --rm --env-file .env -v nexus-data:/data nexus
 
 That is the same image the host runs, so it is worth doing once before you
 deploy. The `-v` keeps the memory database in a named Docker volume between
-runs; leave it off and each run starts with an empty one. CI builds the image
+runs; leave it off and each run starts with an empty one. The container
+starts as root only to give that volume to the `nexus` user, then drops
+privileges (`entrypoint.sh`); CI checks the bot ends up running as uid 1000. CI builds the image
 on every push too, and boots it with placeholder tokens to prove it gets as
 far as the startup checks and can open its database at `/data` -- so a broken
 `Dockerfile` turns the build red before it ever reaches a host.

@@ -22,7 +22,12 @@ COPY . .
 ENV NEXUS_DB_PATH=/data/nexus.db
 RUN useradd --create-home --uid 1000 nexus \
     && mkdir -p /data \
-    && chown -R nexus:nexus /app /data
-USER nexus
+    && chown -R nexus:nexus /app /data \
+    && chmod +x /app/entrypoint.sh \
+    && command -v setpriv >/dev/null
 
+# The bot runs as `nexus`, but the container *starts* as root: a volume
+# mounted at /data arrives owned by root whatever the line above did, and only
+# root can hand it over. entrypoint.sh does that, then drops to nexus.
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["python", "bot.py"]
