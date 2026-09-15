@@ -8,13 +8,14 @@ import logging
 import sqlite3
 
 from telegram import Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ReactionType
 from telegram.error import NetworkError
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    MessageReactionHandler,
     filters,
 )
 
@@ -22,6 +23,7 @@ import config
 import metrics
 import todoist
 from agent import build_graph, check_model, run
+from judge import Judge, schedule_nightly
 from memory import Memory
 from scheduler import Proactive, Window, schedule_jobs
 
@@ -41,8 +43,13 @@ GREETING = (
     f"I'll also check in at {config.MORNING_TIME:%H:%M} with what's due and at "
     f"{config.EVENING_TIME:%H:%M} with what got done. "
     "Send /memory to see what I've learned about your habits, /nudge to run the "
-    "overdue check right now, and /status for how the last day went."
+    "overdue check right now, and /status for how the last day went.\n\n"
+    "If a reply gets it wrong, react to it with a thumbs-down, or send /bad and say why: "
+    "it goes in the record, next to what my own judge thought."
 )
+
+# A reaction on one of Nexus's replies, read as the user's verdict on it.
+LABELS = {"\U0001f44e": "bad", "\U0001f44d": "good"}
 
 
 def _is_allowed(update: Update) -> bool:
@@ -106,7 +113,56 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         reply = "Something broke on my side and I couldn't finish that. Check the bot logs."
 
     log.info("-> %s", reply)
-    await update.message.reply_text(reply)
+    sent = await update.message.reply_text(reply)
+    # Which Telegram message carried the reply: a reaction on it names the run.
+    memory = context.bot_data["memory"]
+    latest = memory.latest_run(chat_id)
+    if latest is not None and sent is not None:
+        memory.attach_message(latest.id, sent.message_id)
+
+
+async def on_bad(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/bad [why]: the last reply in this chat was wrong. The note travels
+    with the label, so the reviewer sees the reason and not just the verdict."""
+    if not _is_allowed(update):
+        return
+    memory = context.bot_data["memory"]
+    latest = memory.latest_run(update.effective_chat.id)
+    if latest is None:
+        await update.message.reply_text("Nothing to mark yet - I haven't replied to anything here.")
+        return
+    note = " ".join(context.args or [])
+    memory.label(latest.id, "bad", note)
+    log.info("label: run %s -> bad (%s)", latest.id, note or "no note")
+    await update.message.reply_text(
+        "Noted. That reply is marked as wrong"
+        + (", with your note" if note else "")
+        + "; the judge's grade for it will be checked against that."
+    )
+
+
+async def on_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A thumbs-down or thumbs-up on one of Nexus's replies labels its run;
+    taking the reaction back clears the label. Silent either way: a reaction
+    is not a message, and answering one would be noise."""
+    reaction = update.message_reaction
+    if reaction is None or not _is_allowed(update):
+        return
+    memory = context.bot_data["memory"]
+    found = memory.run_for_message(reaction.chat.id, reaction.message_id)
+    if found is None:
+        return  # not one of our replies, or from before the record began
+    emojis = [item.emoji for item in reaction.new_reaction if item.type == ReactionType.EMOJI]
+    label = next((LABELS[emoji] for emoji in emojis if emoji in LABELS), None)
+    memory.label(found.id, label)
+    log.info("label: run %s -> %s", found.id, label or "cleared")
+
+
+async def on_judge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Grade the recent replies now, and say what the judge did."""
+    if _is_allowed(update):
+        line = await context.bot_data["judge"].nightly(trigger="/judge")
+        await update.message.reply_text(f"Judge: {line}.")
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -194,8 +250,16 @@ def main() -> None:
     app.add_handler(CommandHandler("memory", on_memory))
     app.add_handler(CommandHandler("nudge", on_nudge))
     app.add_handler(CommandHandler("status", on_status))
+    app.add_handler(CommandHandler("bad", on_bad))
+    app.add_handler(CommandHandler("judge", on_judge))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(MessageReactionHandler(on_reaction))
     app.add_error_handler(on_error)
+
+    judge = Judge(memory)
+    app.bot_data["judge"] = judge
+    schedule_nightly(app, judge)
+    log.info("Judge: %s, nightly at %s", config.JUDGE_MODEL, f"{config.JUDGE_TIME:%H:%M}")
 
     log.info("Timezone: %s", config.TIMEZONE)
     proactive = Proactive(
@@ -223,7 +287,8 @@ def main() -> None:
         )
 
     log.info("Nexus is polling. Ctrl-C to stop.")
-    app.run_polling()
+    # Reactions are not delivered unless asked for by name.
+    app.run_polling(allowed_updates=[Update.MESSAGE, Update.MESSAGE_REACTION])
 
 
 if __name__ == "__main__":

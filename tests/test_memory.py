@@ -14,7 +14,7 @@ import pytest
 
 import config
 import memory as memory_module
-from memory import Memory, Pattern, Run, run_id, topic, words
+from memory import Evaluation, Memory, Pattern, Run, run_id, topic, words
 from tests.support import log_rows
 
 TZ = ZoneInfo("America/Toronto")
@@ -683,3 +683,128 @@ def test_an_older_database_gains_the_run_id_column(tmp_path):
     ]
     assert memory.runs(at(0)) == [], "the runs table exists too"
     assert Memory(path).counts() == (2, 0), "reopening does not add the column twice"
+
+
+def test_a_run_row_from_before_labels_gains_the_label_columns(tmp_path):
+    """The runs table shipped without labels; a database from that version
+    must gain them on open."""
+    path = str(tmp_path / "old.db")
+    old = sqlite3.connect(path)
+    old.execute(
+        "CREATE TABLE runs (id TEXT PRIMARY KEY, ts TEXT NOT NULL, chat_id INTEGER NOT NULL, "
+        "kind TEXT NOT NULL, trigger TEXT NOT NULL, reply TEXT NOT NULL, outcome TEXT NOT NULL, "
+        "latency_ms INTEGER NOT NULL, steps INTEGER NOT NULL DEFAULT 0, retries INTEGER NOT "
+        "NULL DEFAULT 0, calls INTEGER NOT NULL DEFAULT 0, tool_calls INTEGER NOT NULL DEFAULT "
+        "0, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, "
+        "cache_read_tokens INTEGER NOT NULL DEFAULT 0, model TEXT NOT NULL DEFAULT '', prompt "
+        "TEXT NOT NULL DEFAULT '', build TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT "
+        "'', trace TEXT NOT NULL DEFAULT '{}')"
+    )
+    old.execute(
+        "INSERT INTO runs (id, ts, chat_id, kind, trigger, reply, outcome, latency_ms) VALUES "
+        "('old1', '2026-09-09T12:00:00+00:00', 7, 'message', 'hi', 'hello', 'ok', 5)"
+    )
+    old.commit()
+    old.close()
+
+    memory = Memory(path, clock=lambda: at(13))
+
+    [run] = memory.runs(at(0))
+    assert (run.id, run.label, run.label_note, run.message_id) == ("old1", None, None, None)
+    assert memory.label("old1", "bad", "wrong")
+    assert memory.latest_run(7).label == "bad"
+
+
+# --- Labels and message ids ----------------------------------------------------------
+
+
+def test_latest_run_is_the_newest_reply_in_the_chat():
+    memory, _ = make()
+    memory.record(a_run(at(9), id="first", chat_id=7))
+    memory.record(a_run(at(10), id="second", chat_id=7))
+    memory.record(a_run(at(11), id="elsewhere", chat_id=8))
+    memory.record(a_run(at(12), id="job", chat_id=7, kind="overdue"))
+
+    assert memory.latest_run(7).id == "second", "the newest *reply*, not the newest row"
+    assert memory.latest_run(8).id == "elsewhere"
+    assert memory.latest_run(9) is None
+
+
+def test_a_reply_can_be_found_by_its_telegram_message():
+    memory, _ = make()
+    memory.record(a_run(at(9), id="r1", chat_id=7))
+
+    memory.attach_message("r1", 555)
+
+    assert memory.run_for_message(7, 555).id == "r1"
+    assert memory.run_for_message(7, 556) is None
+    assert memory.run_for_message(8, 555) is None, "a message id is only unique within a chat"
+    assert memory.latest_run(7).message_id == 555
+
+
+def test_label_sets_clears_and_reports_whether_the_run_exists():
+    memory, _ = make()
+    memory.record(a_run(at(9), id="r1"))
+
+    assert memory.label("r1", "bad", "it made two tasks")
+    assert (memory.latest_run(7).label, memory.latest_run(7).label_note) == (
+        "bad",
+        "it made two tasks",
+    )
+    assert memory.label("r1", "good")
+    assert (memory.latest_run(7).label, memory.latest_run(7).label_note) == ("good", None)
+    assert memory.label("r1", None)
+    assert memory.latest_run(7).label is None
+    assert not memory.label("nope", "bad")
+
+
+# --- The judge's grades ------------------------------------------------------------------
+
+
+def an_evaluation(when, run_id="abc123def456", **overrides):
+    values = {
+        "run_id": run_id,
+        "ts": when,
+        "judge_model": "claude-haiku-4-5",
+        "rubric": "rubric000001",
+        "passed": {"told_the_truth": True, "kept_it_short": False},
+        "reasons": {"told_the_truth": "backed by the tool", "kept_it_short": "three sentences"},
+        "category": "prompt",
+        "summary": "Did the job, at length.",
+        "input_tokens": 900,
+        "output_tokens": 80,
+        "latency_ms": 700,
+    }
+    return Evaluation(**{**values, **overrides})
+
+
+def test_evaluations_round_trip_and_grading_again_replaces():
+    memory, clock = make()
+    memory.record(a_run(clock["now"]))
+    first = an_evaluation(clock["now"])
+
+    memory.evaluate(first)
+
+    assert memory.evaluations_for(["abc123def456", "other"]) == {"abc123def456": first}
+    assert first.failed == ["kept_it_short"] and not first.clean
+
+    second = an_evaluation(at(10), passed={"told_the_truth": True, "kept_it_short": True})
+    memory.evaluate(second)
+    assert memory.evaluations_for(["abc123def456"]) == {"abc123def456": second}
+    assert second.clean and second.failed == []
+    assert memory.evaluations_for([]) == {}
+
+
+def test_ungraded_is_the_replies_without_a_grade_oldest_first():
+    memory, _ = make()
+    memory.record(a_run(at(12), id="noon"))
+    memory.record(a_run(at(9), id="nine"))
+    memory.record(a_run(at(10), id="ten-graded"))
+    memory.record(a_run(at(11), id="crashed", outcome="crashed", reply=""))
+    memory.record(a_run(at(11), id="job", kind="overdue"))
+    memory.record(a_run(at(6), id="early"))
+    memory.evaluate(an_evaluation(at(13), run_id="ten-graded"))
+
+    assert [run.id for run in memory.ungraded(at(8), limit=10)] == ["nine", "noon"]
+    assert [run.id for run in memory.ungraded(at(8), limit=1)] == ["nine"]
+    assert [run.id for run in memory.ungraded(at(0), limit=10)] == ["early", "nine", "noon"]

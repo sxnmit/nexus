@@ -1,6 +1,6 @@
 """Lightweight memory: an interaction log and a few learned habits, in SQLite.
 
-Four tables and no embeddings.
+Five tables and no embeddings.
 
 `interactions`  Everything said and done, in order: each user message, each
                 tool call with its arguments and outcome, each reply, and each
@@ -15,8 +15,15 @@ Four tables and no embeddings.
                 and retries, what the model calls cost, how long it took, and
                 a trace of what the model saw and did. The prompt version and
                 the build are on every row, so a change to either shows up in
-                what followed. This is the record an evaluator reads; the
-                scorecard in metrics.py reads it today.
+                what followed. The user's own verdict on a reply -- a thumbs
+                down, a /bad -- is a label on the row. This is the record the
+                judge and the scorecard read.
+
+`evaluations`   The judge's grades (judge.py), one row per graded run: pass
+                or fail per rubric property with a one-line reason, a failure
+                category, a summary, and what the grading cost. Kept apart
+                from `runs` because grades come later, from another model,
+                under a rubric that has its own version.
 
 `patterns`      One row per *topic* -- a task name with the noise stripped, so
                 "Go to the gym tomorrow" and "gym" share a row -- holding
@@ -112,9 +119,26 @@ CREATE TABLE IF NOT EXISTS runs (
     prompt            TEXT    NOT NULL DEFAULT '',  -- agent.PROMPT_VERSION
     build             TEXT    NOT NULL DEFAULT '',  -- the git commit, when known
     error             TEXT    NOT NULL DEFAULT '',
-    trace             TEXT    NOT NULL DEFAULT '{}' -- JSON; see agent._trace
+    trace             TEXT    NOT NULL DEFAULT '{}', -- JSON; see agent._trace
+    label             TEXT,                          -- the user's verdict: good | bad
+    label_note        TEXT,                          -- what they said with it
+    message_id        INTEGER                        -- Telegram's id for the reply, for reactions
 );
 CREATE INDEX IF NOT EXISTS runs_by_time ON runs (ts);
+
+CREATE TABLE IF NOT EXISTS evaluations (
+    run_id        TEXT    PRIMARY KEY,           -- runs.id
+    ts            TEXT    NOT NULL,              -- UTC: when it was graded
+    judge_model   TEXT    NOT NULL,
+    rubric        TEXT    NOT NULL,              -- judge.RUBRIC_VERSION
+    passed        TEXT    NOT NULL,              -- JSON: property -> true | false
+    reasons       TEXT    NOT NULL,              -- JSON: property -> one line
+    category      TEXT    NOT NULL,              -- judge.CATEGORIES
+    summary       TEXT    NOT NULL,
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    latency_ms    INTEGER NOT NULL DEFAULT 0
+);
 
 CREATE TABLE IF NOT EXISTS patterns (
     topic          TEXT PRIMARY KEY,
@@ -138,7 +162,10 @@ CREATE TABLE IF NOT EXISTS state (
 
 # Columns added after a table first shipped. CREATE TABLE IF NOT EXISTS leaves
 # an existing table alone, so a database from an earlier version gets them here.
-_ADDED_COLUMNS = {"interactions": [("run_id", "TEXT")]}
+_ADDED_COLUMNS = {
+    "interactions": [("run_id", "TEXT")],
+    "runs": [("label", "TEXT"), ("label_note", "TEXT"), ("message_id", "INTEGER")],
+}
 
 
 # --- Topics -------------------------------------------------------------------------
@@ -282,6 +309,10 @@ class Run:
     The counters and token fields are zero for a job: the templates never call
     the model. `trace` is JSON the evaluator reads; for a message run it holds
     what the model saw and every step it took (see agent._trace).
+
+    `label` is the user's own verdict on a reply -- "good" or "bad", from a
+    reaction or /bad -- with what they said in `label_note`. `message_id` is
+    Telegram's id for the reply, which is how a reaction finds its run.
     """
 
     id: str
@@ -304,6 +335,38 @@ class Run:
     build: str = ""
     error: str = ""
     trace: dict = field(default_factory=dict)
+    label: str | None = None
+    label_note: str | None = None
+    message_id: int | None = None
+
+
+@dataclass(frozen=True)
+class Evaluation:
+    """The judge's grades for one run: each rubric property passed or failed,
+    with a one-line reason; a category for what went wrong (or "none"); and a
+    one-sentence summary for the reviewer. `judge_model` and `rubric` say who
+    graded it and under which rubric, so grades from different rubrics are
+    never averaged together by mistake."""
+
+    run_id: str
+    ts: datetime
+    judge_model: str
+    rubric: str
+    passed: dict  # property -> bool
+    reasons: dict  # property -> str
+    category: str
+    summary: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    latency_ms: int = 0
+
+    @property
+    def failed(self) -> list[str]:
+        return [name for name, ok in self.passed.items() if not ok]
+
+    @property
+    def clean(self) -> bool:
+        return not self.failed
 
 
 # --- What a tool event means --------------------------------------------------------
@@ -435,16 +498,102 @@ class Memory:
             params.append(self._stamp(until))
         with self._lock:
             rows = self._db.execute(query + " ORDER BY ts, rowid", params).fetchall()
-        return [
-            Run(
+        return [self._run(row) for row in rows]
+
+    def _run(self, row: sqlite3.Row) -> Run:
+        return Run(
+            **{
+                **dict(row),
+                "ts": self._local(row["ts"]),
+                "trace": json.loads(row["trace"]),
+            }
+        )
+
+    @staticmethod
+    def _local(stamp: str) -> datetime:
+        return datetime.fromisoformat(stamp).astimezone(config.TIMEZONE)
+
+    def latest_run(self, chat_id: int) -> Run | None:
+        """The most recent reply in a chat: what "that last one" refers to."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM runs WHERE chat_id = ? AND kind = 'message'"
+                " ORDER BY ts DESC, rowid DESC LIMIT 1",
+                (chat_id,),
+            ).fetchone()
+        return None if row is None else self._run(row)
+
+    def run_for_message(self, chat_id: int, message_id: int) -> Run | None:
+        """The run whose reply is this Telegram message, if it was one of ours."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM runs WHERE chat_id = ? AND message_id = ?", (chat_id, message_id)
+            ).fetchone()
+        return None if row is None else self._run(row)
+
+    def attach_message(self, run_id: str, message_id: int) -> None:
+        """Remember which Telegram message carried a run's reply."""
+        with self._lock, self._db:
+            self._db.execute("UPDATE runs SET message_id = ? WHERE id = ?", (message_id, run_id))
+
+    def label(self, run_id: str, label: str | None, note: str = "") -> bool:
+        """The user's verdict on a run: "good", "bad", or None to take it back.
+        Returns whether there was such a run."""
+        with self._lock, self._db:
+            cursor = self._db.execute(
+                "UPDATE runs SET label = ?, label_note = ? WHERE id = ?",
+                (label, note or None, run_id),
+            )
+        return cursor.rowcount == 1
+
+    # --- The judge's grades ----------------------------------------------------------
+
+    def evaluate(self, evaluation: Evaluation) -> None:
+        """Keep the judge's grades for one run. Grading it again replaces them."""
+        names = [item.name for item in fields(Evaluation)]
+        values = {name: getattr(evaluation, name) for name in names}
+        values["ts"] = self._stamp(evaluation.ts)
+        values["passed"] = json.dumps(evaluation.passed)
+        values["reasons"] = json.dumps(evaluation.reasons)
+        with self._lock, self._db:
+            self._db.execute(
+                f"INSERT OR REPLACE INTO evaluations ({', '.join(names)})"
+                f" VALUES ({', '.join(':' + name for name in names)})",
+                values,
+            )
+
+    def evaluations_for(self, run_ids: Iterable[str]) -> dict[str, Evaluation]:
+        """The grades for these runs, keyed by run id; ungraded runs are absent."""
+        ids = list(run_ids)
+        if not ids:
+            return {}
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT * FROM evaluations WHERE run_id IN ({', '.join('?' * len(ids))})", ids
+            ).fetchall()
+        return {
+            row["run_id"]: Evaluation(
                 **{
                     **dict(row),
-                    "ts": datetime.fromisoformat(row["ts"]).astimezone(config.TIMEZONE),
-                    "trace": json.loads(row["trace"]),
+                    "ts": self._local(row["ts"]),
+                    "passed": json.loads(row["passed"]),
+                    "reasons": json.loads(row["reasons"]),
                 }
             )
             for row in rows
-        ]
+        }
+
+    def ungraded(self, since: datetime, limit: int) -> list[Run]:
+        """Replies since `since` the judge has not graded, oldest first. A
+        crashed run has no reply to grade and is left out."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT runs.* FROM runs LEFT JOIN evaluations ON evaluations.run_id = runs.id"
+                " WHERE runs.kind = 'message' AND runs.outcome != 'crashed' AND runs.ts >= ?"
+                " AND evaluations.run_id IS NULL ORDER BY runs.ts, runs.rowid LIMIT ?",
+                (self._stamp(since), limit),
+            ).fetchall()
+        return [self._run(row) for row in rows]
 
     # --- The habits ------------------------------------------------------------------
 

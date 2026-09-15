@@ -14,22 +14,60 @@ import pytest
 
 import bot
 import config
+from memory import Memory, Run
+
+SENT_MESSAGE_ID = 555
 
 
-def make_update(text="hello", user_id=42, chat_id=7, has_user=True):
+def make_update(text="hello", user_id=42, chat_id=7, has_user=True, reaction=None):
+    """A Telegram update: a text message by default, or a reaction on one of
+    the bot's messages (`reaction` is the new list of emoji, [] for taken back)."""
+    message_reaction = None
+    if reaction is not None:
+        message_reaction = SimpleNamespace(
+            chat=SimpleNamespace(id=chat_id),
+            message_id=SENT_MESSAGE_ID,
+            new_reaction=[SimpleNamespace(type="emoji", emoji=emoji) for emoji in reaction],
+        )
     return SimpleNamespace(
-        message=SimpleNamespace(text=text, reply_text=AsyncMock()),
+        message=SimpleNamespace(
+            text=text,
+            reply_text=AsyncMock(return_value=SimpleNamespace(message_id=SENT_MESSAGE_ID)),
+        ),
+        message_reaction=message_reaction,
         effective_user=SimpleNamespace(id=user_id) if has_user else None,
         effective_chat=SimpleNamespace(id=chat_id),
     )
 
 
-def make_context(graph="the-graph", memory="the-memory", proactive=None, args=()):
+def make_context(graph="the-graph", memory=None, proactive=None, judge=None, args=()):
     return SimpleNamespace(
         bot=SimpleNamespace(send_chat_action=AsyncMock()),
-        bot_data={"graph": graph, "memory": memory, "proactive": proactive},
+        bot_data={
+            "graph": graph,
+            "memory": memory if memory is not None else Memory(),
+            "proactive": proactive,
+            "judge": judge,
+        },
         args=list(args),
     )
+
+
+def a_reply(memory, chat_id=7, run_id="run1", reply="Added it."):
+    """A recorded reply in `memory`, as agent.run() would leave one."""
+    memory.record(
+        Run(
+            id=run_id,
+            ts=memory.now(),
+            chat_id=chat_id,
+            kind="message",
+            trigger="add milk",
+            reply=reply,
+            outcome="ok",
+            latency_ms=1,
+        )
+    )
+    return run_id
 
 
 @pytest.fixture(autouse=True)
@@ -76,7 +114,9 @@ def test_on_message_runs_the_agent_and_replies(open_bot, monkeypatch):
 
     asyncio.run(bot.on_message(update, context))
 
-    assert calls == [("the-graph", "add milk", "the-memory", 7)], "graph, text, memory, chat id"
+    assert calls == [("the-graph", "add milk", context.bot_data["memory"], 7)], (
+        "graph, text, memory, chat id"
+    )
     context.bot.send_chat_action.assert_awaited_once()
     assert context.bot.send_chat_action.await_args.kwargs["chat_id"] == 7
     update.message.reply_text.assert_awaited_once_with("Added it.")
@@ -133,6 +173,157 @@ def test_on_message_replies_with_a_fallback_when_the_agent_crashes(open_bot, mon
     reply = update.message.reply_text.await_args.args[0]
     assert "Something broke" in reply
     assert "api down" not in reply, "internal errors stay in the logs"
+
+
+def test_on_message_remembers_which_telegram_message_carried_the_reply(open_bot, monkeypatch):
+    context = make_context()
+    memory = context.bot_data["memory"]
+
+    def fake_run(graph, text, store, chat_id):
+        a_reply(store, chat_id)  # what agent.run() leaves in the record
+        return "Added it."
+
+    monkeypatch.setattr(bot, "run", fake_run)
+
+    asyncio.run(bot.on_message(make_update("add milk"), context))
+
+    assert memory.run_for_message(7, SENT_MESSAGE_ID).id == "run1"
+
+
+def test_on_message_copes_when_no_run_was_recorded(open_bot, monkeypatch):
+    monkeypatch.setattr(bot, "run", lambda *a: "ok")
+    context = make_context()
+
+    asyncio.run(bot.on_message(make_update(), context))
+
+    assert context.bot_data["memory"].run_for_message(7, SENT_MESSAGE_ID) is None
+
+
+# --- /bad and reactions: the user's own verdicts ------------------------------
+
+
+def test_on_bad_labels_the_last_reply_with_the_note(open_bot):
+    context = make_context(args=["it", "made", "two", "tasks"])
+    a_reply(context.bot_data["memory"])
+    update = make_update("/bad it made two tasks")
+
+    asyncio.run(bot.on_bad(update, context))
+
+    run = context.bot_data["memory"].latest_run(7)
+    assert (run.label, run.label_note) == ("bad", "it made two tasks")
+    reply = update.message.reply_text.await_args.args[0]
+    assert reply.startswith("Noted. That reply is marked as wrong, with your note")
+
+
+def test_on_bad_without_a_note(open_bot):
+    context = make_context()
+    a_reply(context.bot_data["memory"])
+    update = make_update("/bad")
+
+    asyncio.run(bot.on_bad(update, context))
+
+    run = context.bot_data["memory"].latest_run(7)
+    assert (run.label, run.label_note) == ("bad", None)
+    assert "with your note" not in update.message.reply_text.await_args.args[0]
+
+
+def test_on_bad_says_so_when_there_is_nothing_to_mark(open_bot):
+    update = make_update("/bad")
+
+    asyncio.run(bot.on_bad(update, make_context()))
+
+    update.message.reply_text.assert_awaited_once_with(
+        "Nothing to mark yet - I haven't replied to anything here."
+    )
+
+
+def test_on_bad_is_silent_for_unauthorised_users(locked_bot):
+    context = make_context()
+    a_reply(context.bot_data["memory"])
+    update = make_update("/bad", user_id=2)
+
+    asyncio.run(bot.on_bad(update, context))
+
+    update.message.reply_text.assert_not_awaited()
+    assert context.bot_data["memory"].latest_run(7).label is None
+
+
+@pytest.mark.parametrize(
+    ("reaction", "label"),
+    [
+        (["\U0001f44e"], "bad"),
+        (["\U0001f44d"], "good"),
+        (["\U0001f525", "\U0001f44e"], "bad"),
+        (["\U0001f525"], None),
+        ([], None),
+    ],
+)
+def test_on_reaction_labels_the_run_behind_the_message(open_bot, reaction, label):
+    context = make_context()
+    memory = context.bot_data["memory"]
+    memory.attach_message(a_reply(memory), SENT_MESSAGE_ID)
+    memory.label("run1", "bad")  # an earlier verdict, to be replaced or cleared
+
+    asyncio.run(bot.on_reaction(make_update(reaction=reaction), context))
+
+    assert memory.latest_run(7).label == label
+
+
+def test_on_reaction_ignores_custom_emoji_reactions(open_bot):
+    context = make_context()
+    memory = context.bot_data["memory"]
+    memory.attach_message(a_reply(memory), SENT_MESSAGE_ID)
+    update = make_update(reaction=[])
+    update.message_reaction.new_reaction = [
+        SimpleNamespace(type="custom_emoji", custom_emoji_id="x")
+    ]
+
+    asyncio.run(bot.on_reaction(update, context))
+
+    assert memory.latest_run(7).label is None
+
+
+def test_on_reaction_ignores_messages_that_are_not_replies_of_ours(open_bot):
+    context = make_context()
+    a_reply(context.bot_data["memory"])  # recorded, but no message id attached
+
+    asyncio.run(bot.on_reaction(make_update(reaction=["\U0001f44e"]), context))
+
+    assert context.bot_data["memory"].latest_run(7).label is None
+
+
+def test_on_reaction_ignores_unauthorised_users_and_non_reaction_updates(locked_bot):
+    context = make_context()
+    memory = context.bot_data["memory"]
+    memory.attach_message(a_reply(memory), SENT_MESSAGE_ID)
+
+    asyncio.run(bot.on_reaction(make_update(reaction=["\U0001f44e"], user_id=2), context))
+    asyncio.run(bot.on_reaction(make_update(), context))
+
+    assert memory.latest_run(7).label is None
+
+
+# --- /judge -------------------------------------------------------------------
+
+
+def test_on_judge_grades_now_and_reports(open_bot):
+    judge = SimpleNamespace(nightly=AsyncMock(return_value="graded 2 replies: 2 clean"))
+    update = make_update("/judge")
+
+    asyncio.run(bot.on_judge(update, make_context(judge=judge)))
+
+    judge.nightly.assert_awaited_once_with(trigger="/judge")
+    update.message.reply_text.assert_awaited_once_with("Judge: graded 2 replies: 2 clean.")
+
+
+def test_on_judge_is_silent_for_unauthorised_users(locked_bot):
+    judge = SimpleNamespace(nightly=AsyncMock())
+    update = make_update("/judge", user_id=2)
+
+    asyncio.run(bot.on_judge(update, make_context(judge=judge)))
+
+    judge.nightly.assert_not_awaited()
+    update.message.reply_text.assert_not_awaited()
 
 
 # --- /start -------------------------------------------------------------------
@@ -338,13 +529,15 @@ def test_main_wires_the_handlers_and_starts_polling(monkeypatch, todoist_api, ca
     assert app.bot_data["graph"] == "the-graph"
     assert isinstance(app.bot_data["memory"], bot.Memory)
     handler_types = [type(call.args[0]).__name__ for call in app.add_handler.call_args_list]
-    assert handler_types == ["CommandHandler"] * 4 + ["MessageHandler"]
-    commands = [next(iter(call.args[0].commands)) for call in app.add_handler.call_args_list[:4]]
-    assert commands == ["start", "memory", "nudge", "status"]
+    assert handler_types == ["CommandHandler"] * 6 + ["MessageHandler", "MessageReactionHandler"]
+    commands = [next(iter(call.args[0].commands)) for call in app.add_handler.call_args_list[:6]]
+    assert commands == ["start", "memory", "nudge", "status", "bad", "judge"]
     app.add_error_handler.assert_called_once_with(bot.on_error)
     assert isinstance(app.bot_data["proactive"], bot.Proactive), "/nudge needs it even when off"
-    app.run_polling.assert_called_once()
-    assert app.job_queue.run_daily.call_count == 0, "no recipient, so no check-ins"
+    assert isinstance(app.bot_data["judge"], bot.Judge)
+    app.run_polling.assert_called_once_with(allowed_updates=["message", "message_reaction"])
+    names = [call.kwargs["name"] for call in app.job_queue.run_daily.call_args_list]
+    assert names == ["judge"], "no recipient, so no check-ins -- but the judge still runs"
     assert "Proactive messages OFF" in caplog.text
 
 
@@ -354,7 +547,7 @@ def test_main_schedules_the_check_ins_when_there_is_a_recipient(monkeypatch, tod
     bot.main()
 
     names = [call.kwargs["name"] for call in app.job_queue.run_daily.call_args_list]
-    assert names == ["morning", "evening"]
+    assert names == ["judge", "morning", "evening"]
     assert app.job_queue.run_repeating.call_args.kwargs["name"] == "overdue"
 
 

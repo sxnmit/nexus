@@ -135,6 +135,17 @@ TELEGRAM_CHAT_ID = _chat_id(
 )
 
 
+# --- The judge --------------------------------------------------------------------------
+# Which Claude grades the record, and when. The agent's own Haiku by default:
+# grading a transcript against a rubric of checkable properties needs less
+# judgement than holding the conversation did, and it is cheap. It runs once a
+# night over the replies it has not graded yet, at most this many per run, so
+# a busy day cannot run away with the bill.
+JUDGE_MODEL = os.getenv("NEXUS_JUDGE_MODEL", MODEL)
+JUDGE_TIME = _setting("NEXUS_JUDGE_TIME", "03:00", _parse_clock)
+JUDGE_MAX_RUNS = _setting("NEXUS_JUDGE_MAX_RUNS", "50", int)
+
+
 # --- The record -----------------------------------------------------------------------
 # The git commit the running code came from, stamped on every recorded run so
 # a change in behaviour can be traced to a change in code. Railway sets
