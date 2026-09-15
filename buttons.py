@@ -65,10 +65,10 @@ def apply(memory: Memory, chat_id: int, task_id: str, action: str) -> Result:
         raise ValueError(f"unknown button action {action!r}")
     this, started = run_id(), memory.now()
     tool_name = {"done": "complete_task", "tomorrow": "update_task", "drop": "delete_task"}[action]
+    args: dict = {"task": task_id}
     try:
         found = tools._find_task(task_id, LABELS[action].lower())
         name = found.get("content") or task_id
-        args: dict = {"task": task_id}
         if action == "done":
             text, event = tools.complete_task.func(task=task_id)
             line = f"Done: '{name}'"
@@ -96,7 +96,7 @@ def apply(memory: Memory, chat_id: int, task_id: str, action: str) -> Result:
         "tool",
         text,
         kind=tool_name,
-        detail={"args": locals().get("args", {"task": task_id}), "outcome": outcome},
+        detail={"args": args, "outcome": outcome},
         run_id=this,
     )
     memory.learn(event)
