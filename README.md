@@ -317,7 +317,7 @@ answers had to stand on their own.
 
 ## Project layout
 
-Flat on purpose -- it's a learning project, and eleven modules don't need a
+Flat on purpose -- it's a learning project, and twelve modules don't need a
 package.
 
 | File                | What it does                                                        |
@@ -333,6 +333,7 @@ package.
 | `metrics.py`        | Stage 5: the scorecard -- counts over the record, by code alone; `/status` prints it. |
 | `judge.py`          | Stage 5: the nightly judge -- a Haiku grade per reply against a rubric of checkable properties. |
 | `review.py`         | Stage 5: the weekly reviewer -- suggestions with evidence, the ask with buttons, the hand-off, the verification. |
+| `evals.py`          | Stage 5: the regression set -- replays a recorded reply against the fake Todoist and grades it again. Cases live in `tests/cases/`. |
 | `tests/`            | The suite. `support.py` has the fakes, `conftest.py` the fixtures, `test_replan.py` Stage 2, `test_memory.py` Stage 4, `test_metrics.py`, `test_judge.py` and `test_review.py` Stage 5. |
 | `Dockerfile`        | Runs the bot as a worker. Used by any host that takes a Dockerfile. |
 | `entrypoint.sh`     | Starts as root only to hand a mounted `/data` volume to the bot's user, then drops privileges. |
@@ -861,7 +862,8 @@ the judge can be left to read the days you do not.
 
 Every night at `NEXUS_JUDGE_TIME` (03:00 in your timezone) the job grades
 every reply from the last two days it has not graded yet, oldest first, up to
-`NEXUS_JUDGE_MAX_RUNS`. Two days, so a missed night is caught up; a cap, so a
+`NEXUS_JUDGE_MAX_RUNS`. The weekly review runs the same catch-up first, so
+the replies of the day it runs on are graded before it reads them. Two days, so a missed night is caught up; a cap, so a
 busy day cannot run away. A crashed run has no reply and is skipped. An
 answer that does not fit the schema is counted and skipped; an API error
 ends the pass, because the next call would fail the same way. `/judge` runs
@@ -957,6 +959,45 @@ Code session. Either way the rule from the start of Stage 5 holds: nothing
 Nexus learns about itself changes its behaviour at runtime. A suggestion
 becomes code only through a pull request you merge.
 
+### The calibration gate
+
+The judge is graded too, and that grade decides whether it may steer. Of the
+replies with both your label and a grade over the last
+`NEXUS_REVIEW_AGREEMENT_DAYS`, the share where the judge agreed with you must
+be at least `NEXUS_REVIEW_MIN_AGREEMENT` -- once there are
+`NEXUS_REVIEW_MIN_COMPARED` such replies to judge it by. Below the bar the
+review still runs and still keeps what it found, but it holds the ask and
+says why:
+
+```
+The judge agreed with your verdicts on 3 of 6 over the last 30 days, below the bar of 70%, so I'm holding suggestions until the rubric is fixed.
+```
+
+A judge that is wrong about what went wrong should not be proposing changes
+to the code. Fixing the rubric is a pull request like any other; the judge's
+grade under the new rubric shows up in the same number.
+
+### The regression set
+
+Every brief carries the replies it cites as *cases*: the earlier
+conversation, the message, the open tasks exactly as the tools fetched them
+(the record keeps that snapshot with every trace), the reply, the judge's
+grade and your label. [`evals.py`](evals.py) replays a case through the real
+agent against the fake Todoist seeded with those tasks, and has the real
+judge grade the new reply under the same rubric:
+
+```
+python evals.py                      # every case under tests/cases
+python evals.py tests/cases/abc.json # just these
+```
+
+A builder saves the brief's cases under `tests/cases/` and runs them before
+and after the fix. The cases that motivated the fix should turn green; the
+cases behind every earlier fix stay in the set, so a prompt change that fixes
+one thing cannot quietly break another. Replays cost API calls, so they are
+not part of the unit tests, and one thing they cannot reproduce is the habits
+note, which depends on the live counters.
+
 ### Closing the loop
 
 Approval records the prompt version and build at the time. When replies
@@ -982,6 +1023,9 @@ Its job is to stop a change that did nothing from being counted as a win.
 | `NEXUS_REVIEW_TIME`        | `18:00`       | When on that day, in `NEXUS_TIMEZONE`                                |
 | `NEXUS_REVIEW_MIN_EVIDENCE`| `3`           | Distinct replies a proposal must cite (a crash needs one)            |
 | `NEXUS_REVIEW_ASK_DAYS`    | `7`           | At most one ask per this many days                                   |
+| `NEXUS_REVIEW_MIN_AGREEMENT` | `0.7`       | The judge's agreement with your labels needed before an ask goes out |
+| `NEXUS_REVIEW_MIN_COMPARED` | `5`          | How many labelled-and-graded replies before that bar applies         |
+| `NEXUS_REVIEW_AGREEMENT_DAYS` | `30`       | The window that agreement is measured over                           |
 | `API_TOKEN_GITHUB`         | unset         | A fine-grained token with Issues write on the repo; files approved briefs as issues |
 | `NEXUS_GITHUB_REPO`        | unset         | The `owner/name` those issues go to                                  |
 
@@ -998,17 +1042,19 @@ bot makes -- with a prompt along these lines:
 ```
 Look at the open issues in sxnmit/nexus whose title starts with "Nexus suggestion:".
 Take the oldest one that has no linked pull request. Read the brief in full, then read
-the code it names and the README sections on the record, the judge and the reviewer.
-Implement the change on a branch, following the ground rules in the brief: flat layout,
-tests to 100% coverage, ruff clean, a README note on what changed and why. Open a pull
-request that links the issue and quotes the brief's "How to know it worked" line as its
-test plan. Do not merge it. If the brief is unclear or the change would be larger than
-the brief says, comment on the issue with the question instead of guessing.
+the code it names and the README sections on the record, the judge, the reviewer and the
+regression set. Save the brief's regression cases under tests/cases/. Implement the change
+on a branch, following the ground rules in the brief: flat layout, tests to 100% coverage,
+ruff clean, a README note on what changed and why; run python evals.py where the API
+tokens are available and report the result. Open a pull request that links the issue and
+quotes the brief's "How to know it worked" line as its test plan. Do not merge it. If the
+brief is unclear or the change would be larger than the brief says, comment on the issue
+with the question instead of guessing.
 ```
 
-Nexus does not create that routine, and this repository does not contain it:
-a routine that spends your account is yours to set up, and the record will
-say whether what it built helped.
+The routine lives on the owner's Claude Code account, not in this
+repository: it spends that account, so it is theirs to create, and the record
+says whether what it built helped.
 
 ## Deploying
 

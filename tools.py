@@ -22,11 +22,30 @@ Three rules make the observe step in agent.py work:
     not parse; a 200 is not the same as "done".
 """
 
+import contextvars
 import re
 
 from langchain_core.tools import tool
 
 import todoist
+
+# The open tasks as the tools last fetched them during the current run. The
+# record keeps this snapshot with the trace, so a reply can be replayed later
+# against a fake Todoist in exactly the state the agent saw (see evals.py).
+# run() installs a holder before each message; the tools fill it in. It is a
+# holder rather than the list itself because LangGraph runs each node in a
+# copy of the context: a value set inside a node would not be seen outside,
+# but a dict shared by the copies is.
+snapshot: contextvars.ContextVar[dict | None] = contextvars.ContextVar("snapshot", default=None)
+
+
+def _open_tasks() -> list[dict]:
+    tasks = todoist.get_tasks()
+    holder = snapshot.get()
+    if holder is not None:
+        holder["tasks"] = [dict(task) for task in tasks]
+    return tasks
+
 
 # Phrases that mean "clear the due date" rather than set one.
 _REMOVE_DUE = {"no date", "no due date", "none", "remove"}
@@ -89,7 +108,7 @@ def _find_task(reference: str, verb: str) -> dict:
     candidates in the message*, so the model can ask a precise question instead
     of guessing -- and it never has an id it did not get from Todoist.
     """
-    open_tasks = todoist.get_tasks()
+    open_tasks = _open_tasks()
     if not open_tasks:
         raise NeedsClarification(f"There are no open tasks, so there is nothing to {verb}.")
 
@@ -157,7 +176,7 @@ def create_task(content: str, due_string: str = "") -> tuple[str, dict]:
 @tool(parse_docstring=True, response_format="content_and_artifact")
 def list_tasks() -> tuple[str, None]:
     """List the user's open (not yet completed) Todoist tasks."""
-    tasks = todoist.get_tasks()
+    tasks = _open_tasks()
     if not tasks:
         return "There are no open tasks.", None
     return "Open tasks:\n" + "\n".join(_format_task(task) for task in tasks), None

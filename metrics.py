@@ -217,6 +217,14 @@ def _count_corrections(replies: list[Run]) -> int:
     )
 
 
+def agreement(memory: Memory, days: int, now: datetime | None = None) -> tuple[int, int]:
+    """(replies where the judge agreed with the user's label, replies with both)
+    over the last `days` days -- the judge's own grade, on a longer window than
+    the scorecard's because labels are sparse."""
+    card = scorecard(memory, days=days, now=now)
+    return card.agreed, card.compared
+
+
 def scorecard(memory: Memory, days: int = 1, now: datetime | None = None) -> Scorecard:
     """The scorecard for the last `days` days, ending now."""
     until = now or memory.now()

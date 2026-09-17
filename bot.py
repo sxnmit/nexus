@@ -346,7 +346,7 @@ def main() -> None:
         memory=memory,
     )
     app.bot_data["proactive"] = proactive
-    reviewer = Reviewer(memory, proactive)
+    reviewer = Reviewer(memory, proactive, judge=judge)
     app.bot_data["reviewer"] = reviewer
     schedule_weekly(app, reviewer)
     log.info(

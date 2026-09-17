@@ -65,6 +65,7 @@ from pydantic import ValidationError
 
 import config
 import todoist
+import tools
 from memory import Memory, Run, run_id
 from tools import TOOLS, NeedsClarification, UnexpectedResult
 
@@ -566,6 +567,7 @@ def _trace(
         "user": user_text,
         "steps": steps,
         "reply": reply,
+        "tasks": (tools.snapshot.get() or {}).get("tasks"),  # as the tools saw them, or None
     }
 
 
@@ -590,6 +592,7 @@ def run(graph, user_text: str, memory: Memory, chat_id: int = 0) -> str:
     caller still answers honestly and the record still shows it."""
     this = run_id()
     started, clock = memory.now(), time.perf_counter()
+    tools.snapshot.set({"tasks": None})  # the tools fill this in as they fetch
     rows = memory.recent(chat_id)
     history = _history(rows)
     note = memory.note([user_text, *(text for role, text in rows if role == "user")])

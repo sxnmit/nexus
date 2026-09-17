@@ -158,6 +158,16 @@ REVIEW_TIME = _setting("NEXUS_REVIEW_TIME", "18:00", _parse_clock)
 REVIEW_MIN_EVIDENCE = _setting("NEXUS_REVIEW_MIN_EVIDENCE", "3", int)
 REVIEW_ASK_DAYS = _setting("NEXUS_REVIEW_ASK_DAYS", "7", int)
 
+# The calibration gate. The judge is graded against the user's own verdicts;
+# once there are this many replies with both a label and a grade (over the
+# last REVIEW_AGREEMENT_DAYS), suggestions go out only while the judge agrees
+# with the user at least this share of the time. Below the bar, the weekly
+# review says so and holds them: a judge that is wrong about what went wrong
+# should not be steering changes to the code.
+REVIEW_MIN_AGREEMENT = _setting("NEXUS_REVIEW_MIN_AGREEMENT", "0.7", float)
+REVIEW_MIN_COMPARED = _setting("NEXUS_REVIEW_MIN_COMPARED", "5", int)
+REVIEW_AGREEMENT_DAYS = _setting("NEXUS_REVIEW_AGREEMENT_DAYS", "30", int)
+
 # Where an approved suggestion goes. With a GitHub token that can open issues
 # on the repository, it is filed as an issue for a builder to pick up; without
 # one, Nexus sends you the brief to paste into a Claude Code session yourself.

@@ -635,6 +635,15 @@ def test_run_traces_what_the_model_saw_and_did(ask, memory, todoist_api):
     assert answered["usage"] == {"input": 0, "output": 0, "cache_read": 0}
 
 
+def test_run_keeps_the_tasks_the_tools_saw_in_the_trace(ask, memory, todoist_api):
+    todoist_api(tasks=[{"id": "1", "content": "Buy milk"}])
+    ask(ScriptedModel(tool_call("list_tasks", {}), AIMessage("One.")), "list")
+    assert latest_run(memory).trace["tasks"] == [{"id": "1", "content": "Buy milk"}]
+
+    ask(ScriptedModel(AIMessage("Hi.")), "hello")
+    assert memory.latest_run(7).trace["tasks"] is None, "no tool fetched the list this run"
+
+
 def test_run_records_the_observers_verdicts(ask, memory, todoist_api):
     todoist_api(tasks=[], fail="HTTP 503 - down", fail_status=503, fail_times=1)
     model = ScriptedModel(
