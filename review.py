@@ -48,7 +48,7 @@ from typing import Literal
 
 import httpx
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 import config
 import evals
@@ -99,7 +99,8 @@ class Proposal(BaseModel):
 
 
 class Review(BaseModel):
-    """What the reviewer returns. A schema, so the parse is deterministic."""
+    """What the reviewer returns, as the one tool it may call. The API enforces
+    the schema (strict tool use), nested proposals included."""
 
     proposals: list[Proposal] = Field(description="At most three. None is a good answer.")
     note: str = Field(description="One sentence on the week.")
@@ -231,7 +232,7 @@ class Reviewer:
         self._clock = clock
         self.model_name = config.REVIEW_MODEL
         llm = model if model is not None else build_llm(config.REVIEW_MODEL, max_tokens=4096)
-        self._reviewer = llm.with_structured_output(Review, include_raw=True)
+        self._reviewer = llm.bind_tools([Review], tool_choice=Review.__name__, strict=True)
 
     def now(self) -> datetime:
         current = self._clock() if self._clock else datetime.now(config.TIMEZONE)
@@ -277,10 +278,14 @@ class Reviewer:
         """One model call: the record in, a Review out. Raises ReviewError when
         the answer did not fit the schema; lets an API error through."""
         card, text, ids = self.read(now)
-        result = self._reviewer.invoke([SystemMessage(_instructions()), HumanMessage(text)])
-        review = result.get("parsed")
-        if review is None:
-            raise ReviewError(f"the answer did not fit the schema: {result.get('parsing_error')}")
+        message = self._reviewer.invoke([SystemMessage(_instructions()), HumanMessage(text)])
+        calls = [call for call in (message.tool_calls or []) if call["name"] == Review.__name__]
+        if not calls:
+            raise ReviewError("the answer did not fit the schema: no review was returned")
+        try:
+            review = Review.model_validate(calls[0]["args"])
+        except ValidationError as exc:
+            raise ReviewError(f"the answer did not fit the schema: {exc}") from exc
         return review, card, ids
 
     def _keep(self, proposals: list[Proposal], ids: set[str], now: datetime) -> list[Suggestion]:
