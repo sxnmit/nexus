@@ -369,6 +369,19 @@ def test_a_label_on_an_ungraded_reply_counts_but_is_not_compared():
     assert "Labels: 1 good.\n" in card.text()
 
 
+def test_agreement_is_the_judges_grade_over_a_longer_window():
+    memory = Memory()
+    old = reply(memory, 60 * 24 * 10)  # ten days ago: outside the day, inside the month
+    grade(memory, old, passed={"told_the_truth": False})
+    memory.label(old.id, "bad")
+    recent = reply(memory, 5)
+    grade(memory, recent)
+    memory.label(recent.id, "bad")
+
+    assert metrics.agreement(memory, 30, now=NOW) == (1, 2)
+    assert metrics.agreement(memory, 1, now=NOW) == (0, 1)
+
+
 def test_judge_line_without_failures_or_categories():
     memory = Memory()
     grade(memory, reply(memory, 10))

@@ -79,7 +79,7 @@ def unparsable():
     return {"raw": AIMessage("x"), "parsed": None, "parsing_error": ValueError("bad")}
 
 
-def make(*results, chat_id=42, quiet=("22:00", "07:00"), now=NOW):
+def make(*results, chat_id=42, quiet=("22:00", "07:00"), now=NOW, judge=None):
     clock = {"now": now}
     memory = Memory(":memory:", clock=lambda: clock["now"])
     outbox = Outbox()
@@ -91,7 +91,10 @@ def make(*results, chat_id=42, quiet=("22:00", "07:00"), now=NOW):
         clock=lambda: clock["now"],
     )
     model = ScriptedReviewer(*results)
-    reviewer = review.Reviewer(memory, proactive, model=model, clock=lambda: clock["now"])
+    the_judge = None if judge is None else judge(memory, clock)
+    reviewer = review.Reviewer(
+        memory, proactive, model=model, clock=lambda: clock["now"], judge=the_judge
+    )
     return reviewer, memory, outbox, model, clock
 
 
@@ -962,3 +965,184 @@ def test_read_reminds_the_reviewer_how_settled_suggestions_turned_out():
         "- [found 11 Sep] Undo (feature)\n"
         "- [verified 26 Aug] Default next week (prompt) -- 4 of 8 before, 2 of 12 after"
     ) in text
+
+
+# --- Grading first, and the calibration gate --------------------------------------------
+
+
+def test_weekly_grades_the_ungraded_replies_before_it_reads():
+    import judge as judge_module
+    from tests.test_judge import ScriptedGrader, answer
+
+    def judge_factory(memory, clock):
+        return judge_module.Judge(
+            memory,
+            model=ScriptedGrader(answer(passed={"told_the_truth": False}, category="model")),
+            clock=lambda: clock["now"],
+        )
+
+    reviewer, memory, outbox, _, _ = make(answer_review(), judge=judge_factory)
+    reply(memory, "fresh", 2)  # ungraded when the review starts
+
+    asyncio.run(reviewer.weekly())
+
+    assert memory.evaluations_for(["fresh"])["fresh"].failed == ["told_the_truth"]
+    assert outbox.sent[0][1].startswith("Weekly review: 1 replies, 0 of 1 graded clean.")
+
+
+def answer_review(*proposals, note="A quiet week."):
+    return answer(*proposals, note=note)
+
+
+def labelled_and_graded(memory, agree, disagree):
+    """`agree` replies where the judge and the user agree, `disagree` where not."""
+    hours = 200
+    for _ in range(agree):
+        hours -= 1
+        run = reply(memory, f"a{hours}", hours)
+        grade(memory, run.id, failed=("told_the_truth",))
+        memory.label(run.id, "bad")
+    for _ in range(disagree):
+        hours -= 1
+        run = reply(memory, f"d{hours}", hours)
+        grade(memory, run.id)
+        memory.label(run.id, "bad")
+
+
+def test_calibration_before_enough_verdicts_lets_suggestions_through():
+    reviewer, memory, _, _, _ = make()
+    labelled_and_graded(memory, agree=1, disagree=3)
+
+    trusted, line = reviewer.calibration(NOW)
+
+    assert trusted
+    assert (
+        line
+        == "The judge has been checked against 4 of your verdicts so far; it takes 5 before the bar applies."
+    )
+
+
+def test_calibration_holds_suggestions_when_the_judge_disagrees_too_often():
+    reviewer, memory, outbox, _, _ = make(answer(proposal(["r1", "r2", "r3"])))
+    a_week(memory)
+    labelled_and_graded(memory, agree=3, disagree=3)  # 50%, below 70%
+
+    trusted, line = reviewer.calibration(NOW)
+    assert not trusted
+    assert line == (
+        "The judge agreed with your verdicts on 3 of 6 over the last 30 days, below the bar of "
+        "70%, so I'm holding suggestions until the rubric is fixed."
+    )
+
+    line_out = asyncio.run(reviewer.weekly())
+
+    [(_, text)] = outbox.sent
+    assert text.startswith("The judge agreed with your verdicts on 3 of 6")
+    assert "Nothing worth changing" not in text and "Build it?" not in text
+    assert [item.status for item in memory.suggestions()] == ["found"], "kept, not asked"
+    assert line_out == "found 1, ask deferred (sent)"
+
+
+def test_calibration_passes_when_the_judge_agrees_enough():
+    reviewer, memory, outbox, _, _ = make(answer(proposal(["r1", "r2", "r3"])))
+    a_week(memory)
+    labelled_and_graded(memory, agree=5, disagree=1)
+
+    trusted, line = reviewer.calibration(NOW)
+    assert (
+        trusted and line == "The judge agreed with your verdicts on 5 of 6 over the last 30 days."
+    )
+
+    asyncio.run(reviewer.weekly())
+
+    assert outbox.sent[0][1].endswith("Build it?")
+
+
+# --- Regression cases in the brief -------------------------------------------------------
+
+
+def test_brief_carries_the_cited_replies_as_cases_when_they_have_snapshots():
+    reviewer, memory, _, _, _ = make()
+    a_week(memory)
+    memory.record(
+        Run(
+            id="snap",
+            ts=NOW - timedelta(hours=1),
+            chat_id=42,
+            kind="message",
+            trigger="list",
+            reply="One.",
+            outcome="ok",
+            latency_ms=1,
+            trace={
+                "user": "list",
+                "reply": "One.",
+                "steps": [],
+                "history": [],
+                "memory_note": "",
+                "tasks": [{"id": "1", "content": "Milk"}],
+            },
+        )
+    )
+    suggestion = asked(memory, evidence=["r1", "snap"])
+
+    brief = reviewer.brief(suggestion)
+
+    assert "## Regression cases" in brief
+    assert "```json" in brief and '"id": "snap"' in brief and '"content": "Milk"' in brief
+    assert '"id": "r1"' not in brief, "r1 was recorded without a snapshot and cannot be replayed"
+    assert brief.index("## Regression cases") < brief.index("## Ground rules")
+    assert "## Regression cases" not in reviewer.brief(suggestion, with_cases=False)
+
+
+def test_brief_without_snapshots_has_no_cases_section():
+    reviewer, memory, _, _, _ = make()
+    a_week(memory)
+
+    assert "## Regression cases" not in reviewer.brief(asked(memory))
+
+
+def test_the_issue_gets_the_cases_and_the_telegram_fallback_does_not(monkeypatch):
+    monkeypatch.setattr(config, "GITHUB_TOKEN", "ghp_test")
+    monkeypatch.setattr(config, "GITHUB_REPO", "sxnmit/nexus")
+    bodies = []
+
+    def fake_post(url, headers, json, timeout):
+        bodies.append(json["body"])
+        return httpx.Response(
+            201,
+            json={"html_url": "https://github.com/sxnmit/nexus/issues/9"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(review.httpx, "post", fake_post)
+    reviewer, memory, _, _, _ = make()
+    memory.record(
+        Run(
+            id="snap",
+            ts=NOW - timedelta(hours=1),
+            chat_id=42,
+            kind="message",
+            trigger="list",
+            reply="One.",
+            outcome="ok",
+            latency_ms=1,
+            trace={
+                "user": "list",
+                "reply": "One.",
+                "steps": [],
+                "history": [],
+                "memory_note": "",
+                "tasks": [],
+            },
+        )
+    )
+    asked(memory, evidence=["snap"])
+
+    reviewer.decide("s1", "yes", NOW)
+    assert "## Regression cases" in bodies[0]
+
+    monkeypatch.setattr(config, "GITHUB_TOKEN", "")
+    asked(memory, id="s2", evidence=["snap"])
+    text = reviewer.decide("s2", "yes", NOW)
+    assert "## Regression cases" not in text

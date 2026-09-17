@@ -17,6 +17,13 @@ And the close of the loop: once enough replies have run under a new prompt
 version or build after an approval, the reviewer compares the graded record
 before and after and says whether the change helped.
 
+Two more things keep the loop honest. The judge is graded too: where the
+user's labels and the judge's grades disagree too often, the review says so
+and holds its suggestions (the calibration gate). And every brief carries the
+cited replies as replayable cases -- the message, the open tasks as the tools
+saw them, the reply, the grade -- so a builder can prove a fix against the
+very replies that motivated it (see evals.py).
+
 What keeps it honest:
 
   * Its evidence is checked. Every run id a proposal cites must be a real
@@ -31,6 +38,7 @@ What keeps it honest:
 """
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import Callable
@@ -43,8 +51,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 import config
+import evals
 import metrics
 from agent import PROMPT_VERSION, SYSTEM_PROMPT, build_llm
+from judge import Judge
 from memory import Memory, Run, Suggestion, run_id, words
 from scheduler import DAILY_GRACE, MAX_MESSAGE, Proactive
 from tools import TOOLS
@@ -213,9 +223,11 @@ class Reviewer:
         proactive: Proactive,
         model=None,
         clock: Callable[[], datetime] | None = None,
+        judge: Judge | None = None,
     ):
         self.memory = memory
         self.proactive = proactive
+        self.judge = judge  # grades what is still ungraded before a review reads
         self._clock = clock
         self.model_name = config.REVIEW_MODEL
         llm = model if model is not None else build_llm(config.REVIEW_MODEL, max_tokens=4096)
@@ -400,10 +412,32 @@ class Reviewer:
             ),
         )
 
+    def calibration(self, now: datetime) -> tuple[bool, str]:
+        """Is the judge trusted enough to steer a suggestion? (allowed, one line)."""
+        agreed, compared = metrics.agreement(self.memory, config.REVIEW_AGREEMENT_DAYS, now)
+        if compared < config.REVIEW_MIN_COMPARED:
+            return True, (
+                f"The judge has been checked against {compared} of your verdicts so far; "
+                f"it takes {config.REVIEW_MIN_COMPARED} before the bar applies."
+            )
+        share = agreed / compared
+        line = (
+            f"The judge agreed with your verdicts on {agreed} of {compared} "
+            f"over the last {config.REVIEW_AGREEMENT_DAYS} days"
+        )
+        if share >= config.REVIEW_MIN_AGREEMENT:
+            return True, line + "."
+        return False, (
+            line + f", below the bar of {config.REVIEW_MIN_AGREEMENT:.0%}, so I'm holding "
+            "suggestions until the rubric is fixed."
+        )
+
     def outcome(self, now: datetime | None = None) -> Outcome:
-        """The whole weekly pass, minus the sending: read, propose, keep, verify,
-        pick the ask, compose the message."""
+        """The whole weekly pass, minus the sending: grade what is ungraded,
+        read, propose, keep, verify, check the judge, pick the ask, compose."""
         now = now or self.now()
+        if self.judge is not None:
+            self.judge.catch_up()
         review, card, ids = self.propose(now)
         kept = self._keep(review.proposals, ids, now)
         verified = self.verify(now)
@@ -411,10 +445,13 @@ class Reviewer:
             f"Weekly review: {card.reply_count} replies, "
             f"{card.graded - card.flawed} of {card.graded} graded clean."
         )
-        ask = self._next_ask(now)
+        trusted, calibration = self.calibration(now)
+        ask = self._next_ask(now) if trusted else None
         lines = []
         if verified:
             lines.append("\n".join(verified))
+        if not trusted:
+            lines.append(calibration)
         if ask is not None:
             text = self._ask_text(ask, summary)
             if lines:
@@ -490,8 +527,9 @@ class Reviewer:
         ]
         return (f"Evidence for '{suggestion.title}':\n" + "\n".join(lines))[:MAX_MESSAGE]
 
-    def brief(self, suggestion: Suggestion) -> str:
-        """The hand-off: everything a builder needs, as markdown."""
+    def brief(self, suggestion: Suggestion, with_cases: bool = True) -> str:
+        """The hand-off: everything a builder needs, as markdown. The regression
+        cases are left out when the brief has to fit in a Telegram message."""
         since = suggestion.ts - WINDOW
         replies = {
             run.id: run
@@ -515,6 +553,24 @@ class Reviewer:
                 f'- Run `{rid}` ({run.ts:%Y-%m-%d %H:%M}): you said "{_quote(run.trigger)}"; '
                 f'Nexus replied "{_quote(run.reply)}".{judged}{label}'
             )
+        cases = [
+            evals.case_from(replies[rid], grades.get(rid))
+            for rid in suggestion.evidence
+            if rid in replies and replies[rid].trace.get("tasks") is not None
+        ]
+        regression = ""
+        if with_cases and cases:
+            regression = (
+                "## Regression cases\n\n"
+                "The cited replies, replayable with `python evals.py` (see README, "
+                '"The regression set"). Save each as `tests/cases/<id>.json`; a fix '
+                "should turn them green without turning any existing case red.\n\n"
+                + "\n\n".join(
+                    "```json\n" + json.dumps(case, indent=1, sort_keys=True) + "\n```"
+                    for case in cases
+                )
+                + "\n\n"
+            )
         return (
             f"# {suggestion.title}\n\n"
             f"**Kind:** {suggestion.kind} · **Effort:** {suggestion.effort} · "
@@ -527,7 +583,8 @@ class Reviewer:
             + "\n\n"
             f"## Proposed change\n\n{suggestion.change}\n\n"
             f"## How to know it worked\n\n{suggestion.test}\n\n"
-            "## Ground rules\n\n"
+            + regression
+            + "## Ground rules\n\n"
             "- One pull request on top of `main`, in the repository's flat layout, with tests "
             "(coverage stays at 100%) and a README note on what changed and why.\n"
             "- Nothing changes at runtime: the change ships as code, and the record will say "
@@ -550,8 +607,7 @@ class Reviewer:
             )
         if action != "yes":
             raise ValueError(f"unknown decision {action!r}")
-        brief = self.brief(suggestion)
-        note, text = self._hand_off(suggestion, brief)
+        note, text = self._hand_off(suggestion)
         self.memory.suggest(
             replace(
                 suggestion,
@@ -565,21 +621,24 @@ class Reviewer:
         log.info("review: approved '%s' -> %s", suggestion.title, note or "brief sent")
         return text[:MAX_MESSAGE]
 
-    def _hand_off(self, suggestion: Suggestion, brief: str) -> tuple[str, str]:
-        """Where an approved suggestion goes: (what to keep on the row, what to say)."""
+    def _hand_off(self, suggestion: Suggestion) -> tuple[str, str]:
+        """Where an approved suggestion goes: (what to keep on the row, what to say).
+        An issue gets the full brief with its regression cases; a Telegram
+        message gets the brief without them, to fit."""
         if config.GITHUB_TOKEN and config.GITHUB_REPO:
             try:
-                url = file_issue(f"Nexus suggestion: {suggestion.title}", brief)
+                url = file_issue(f"Nexus suggestion: {suggestion.title}", self.brief(suggestion))
             except (httpx.HTTPError, KeyError) as exc:
                 log.warning("review: could not file the issue: %s", exc)
                 return "", (
                     f"Approved: {suggestion.title}. I couldn't file the GitHub issue ({exc}), so "
-                    f"here is the brief to paste into a Claude Code session:\n\n{brief}"
+                    f"here is the brief to paste into a Claude Code session:\n\n"
+                    f"{self.brief(suggestion, with_cases=False)}"
                 )
             return url, f"Approved: {suggestion.title}. Filed as {url} for the builder."
         return "", (
             f"Approved: {suggestion.title}. Paste this into a Claude Code session to build it:"
-            f"\n\n{brief}"
+            f"\n\n{self.brief(suggestion, with_cases=False)}"
         )
 
 

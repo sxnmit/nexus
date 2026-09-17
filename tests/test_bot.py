@@ -734,6 +734,7 @@ def test_main_wires_the_handlers_and_starts_polling(monkeypatch, todoist_api, ca
     assert isinstance(app.bot_data["proactive"], bot.Proactive), "/nudge needs it even when off"
     assert isinstance(app.bot_data["judge"], bot.Judge)
     assert isinstance(app.bot_data["reviewer"], bot.Reviewer)
+    assert app.bot_data["reviewer"].judge is app.bot_data["judge"], "the review grades first"
     app.run_polling.assert_called_once_with(
         allowed_updates=["message", "message_reaction", "callback_query"]
     )
