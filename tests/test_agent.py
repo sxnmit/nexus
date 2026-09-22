@@ -139,6 +139,19 @@ def test_system_prompt_spells_out_the_error_handling_contract():
     assert "observer:" in prompt, "the model must be told what the verdict line is"
 
 
+def test_system_prompt_requires_list_tasks_before_reporting_counts_or_status():
+    prompt = agent._system_prompt()
+    assert "always call list_tasks first" in prompt
+    assert "task counts, which tasks are overdue, or what is due today/tomorrow" in prompt
+
+
+def test_system_prompt_forbids_inventing_the_clock():
+    prompt = agent._system_prompt()
+    assert "Never infer the current time or calculate relative times" in prompt
+    assert '"20 minutes ago"' in prompt, "the prompt names the failure it is fixing"
+    assert "only report the due date and time as returned by the tool" in prompt
+
+
 def test_system_prompt_tells_the_model_when_a_reminder_is_really_a_task():
     prompt = agent._system_prompt()
     assert "set_reminder" in prompt
