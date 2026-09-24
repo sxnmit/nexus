@@ -140,6 +140,19 @@ The system prompt is prepended on every call rather than stored in state, so
 it isn't duplicated each time round the loop and always carries the current
 date.
 
+One rule in it is there because the record asked for it. The weekly review
+found five graded replies that failed `told_the_truth` by answering "what's
+overdue?", "tasks?" or "what's due today" from the conversation rather than
+from Todoist -- a wrong count of what was left, a task missing from the list,
+a "(4)" over five items -- and one that turned the due time into "about 20
+minutes ago", a relative time nothing in the trace supports. So the Rules now
+say: call `list_tasks` before reporting task counts, what is overdue, or what
+is due today or tomorrow, and report a due date and time only as the tool
+returned it, never worked out against a clock the model does not have. It
+costs one extra tool call on a question that was being answered from memory,
+which is the point. Whether it worked is a query over the record, not a
+guess: `told_the_truth` failures on those replies should go to zero.
+
 ### `_route` -- the loop
 
 ```python
